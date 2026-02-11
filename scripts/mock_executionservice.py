@@ -20,7 +20,6 @@ from varon_fi.proto.varon_fi_pb2 import (
     OrderRequest,
     OrderStatus,
     OrderSubscription,
-    Position,
     OrderStatusRequest,
     CancelOrderRequest,
     CancelOrderResponse,

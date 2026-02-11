@@ -1,6 +1,7 @@
 """Strategy engine - loads and executes strategies."""
 
 import json
+import uuid
 from typing import Optional
 
 import asyncpg
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 
 from signal_service.strategy.base import BaseStrategy, Signal
 from signal_service.grpc.execution_client import ExecutionServiceClient
-from varon_fi.proto.varon_fi_pb2 import TradeSignal
+from varon_fi.proto.varon_fi_pb2 import TradeSignal, TradingMode, TraceContext
 
 logger = get_logger(__name__)
 
@@ -125,24 +126,36 @@ class StrategyEngine:
         return None
         
     def _to_trade_signal(self, signal: Signal) -> TradeSignal:
-        """Convert internal Signal to TradeSignal protobuf."""
+        """Convert internal Signal to TradeSignal protobuf matching PR#7 proto."""
         now = datetime.now(timezone.utc)
         timestamp = Timestamp()
         timestamp.FromDatetime(now)
-        
+
+        # Convert mode string to TradingMode enum
+        mode_str = (signal.meta.get("mode", "live") if signal.meta else "live").lower()
+        mode = TradingMode.LIVE if mode_str == "live" else TradingMode.PAPER
+
+        # Build TraceContext with correlation and idempotency keys
+        trace = TraceContext(
+            correlation_id=signal.correlation_id if signal.correlation_id else str(uuid.uuid4()),
+            idempotency_key=signal.idempotency_key if signal.idempotency_key else str(uuid.uuid4()),
+            source_service="signal-service",
+            latency_ms=0,  # TODO: Track actual latency
+            timestamp=timestamp,
+        )
+
         return TradeSignal(
+            signal_id=signal.idempotency_key if signal.idempotency_key else str(uuid.uuid4()),
             strategy_id=signal.strategy_id or "",
             strategy_version=signal.strategy_version or "",
             symbol=signal.symbol or "",
+            timeframe=signal.timeframe or "5m",
             side=signal.side,
             price=signal.price or 0.0,
             confidence=signal.confidence,
-            timestamp=timestamp,
-            signal_id=signal.idempotency_key,
-            correlation_id=signal.correlation_id,
-            mode=signal.meta.get("mode", "live") if signal.meta else "live",
-            idempotency_key=signal.idempotency_key,
+            mode=mode,
             meta=signal.meta if signal.meta else {},
+            trace=trace,
         )
         
     async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200) -> pd.DataFrame:

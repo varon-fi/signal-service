@@ -6,8 +6,12 @@ from typing import Optional
 import asyncpg
 import pandas as pd
 from structlog import get_logger
+from google.protobuf.timestamp_pb2 import Timestamp
+from datetime import datetime, timezone
 
 from signal_service.strategy.base import BaseStrategy, Signal
+from signal_service.grpc.execution_client import ExecutionServiceClient
+from varon_fi.proto.varon_fi_pb2 import TradeSignal
 
 logger = get_logger(__name__)
 
@@ -15,10 +19,21 @@ logger = get_logger(__name__)
 class StrategyEngine:
     """Manages live strategies and generates signals."""
     
-    def __init__(self, database_url: str):
+    def __init__(
+        self, 
+        database_url: str,
+        execution_client: Optional[ExecutionServiceClient] = None,
+    ):
         self.database_url = database_url
         self.pool: Optional[asyncpg.Pool] = None
         self.strategies: dict[str, BaseStrategy] = {}
+        self.execution_client = execution_client
+        
+    async def connect_execution_service(self, addr: str):
+        """Connect to ExecutionService for signal forwarding."""
+        self.execution_client = ExecutionServiceClient(addr)
+        await self.execution_client.connect()
+        logger.info("ExecutionService client connected", addr=addr)
         
     async def initialize(self):
         """Initialize DB connection and load active strategies."""
@@ -82,14 +97,53 @@ class StrategyEngine:
                 signal.strategy_version = strategy.version
                 signal.symbol = symbol
                 signal.timeframe = timeframe
+                
+                # Persist to database
                 await self._persist_signal(signal)
+                
+                # Send to ExecutionService if connected
+                if self.execution_client:
+                    try:
+                        trade_signal = self._to_trade_signal(signal)
+                        await self.execution_client.execute_signal(trade_signal)
+                    except Exception as e:
+                        # Log error but don't fail - signal is already persisted
+                        logger.error(
+                            "Failed to send signal to ExecutionService",
+                            signal_id=signal.idempotency_key,
+                            correlation_id=signal.correlation_id,
+                            error=str(e),
+                        )
+                
                 logger.info("Signal generated", 
                           strategy=strategy.name, 
                           symbol=symbol, 
-                          side=signal.side)
+                          side=signal.side,
+                          correlation_id=signal.correlation_id)
                 return signal
                 
         return None
+        
+    def _to_trade_signal(self, signal: Signal) -> TradeSignal:
+        """Convert internal Signal to TradeSignal protobuf."""
+        now = datetime.now(timezone.utc)
+        timestamp = Timestamp()
+        timestamp.FromDatetime(now)
+        
+        return TradeSignal(
+            strategy_id=signal.strategy_id or "",
+            strategy_version=signal.strategy_version or "",
+            symbol=signal.symbol or "",
+            side=signal.side,
+            price=signal.price or 0.0,
+            confidence=signal.confidence,
+            timestamp=timestamp,
+            signal_id=signal.idempotency_key,
+            correlation_id=signal.correlation_id,
+            mode="live",
+            idempotency_key=signal.idempotency_key,
+            meta=json.dumps(signal.meta) if signal.meta else "",
+        )
         
     async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200) -> pd.DataFrame:
         """Fetch recent OHLC history from database."""
@@ -121,6 +175,8 @@ class StrategyEngine:
             
     async def shutdown(self):
         """Cleanup resources."""
+        if self.execution_client:
+            await self.execution_client.disconnect()
         if self.pool:
             await self.pool.close()
         logger.info("StrategyEngine shutdown")

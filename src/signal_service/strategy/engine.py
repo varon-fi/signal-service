@@ -140,9 +140,9 @@ class StrategyEngine:
             timestamp=timestamp,
             signal_id=signal.idempotency_key,
             correlation_id=signal.correlation_id,
-            mode="live",
+            mode=signal.meta.get("mode", "live") if signal.meta else "live",
             idempotency_key=signal.idempotency_key,
-            meta=json.dumps(signal.meta) if signal.meta else "",
+            meta=signal.meta if signal.meta else {},
         )
         
     async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200) -> pd.DataFrame:

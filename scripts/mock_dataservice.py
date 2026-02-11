@@ -12,11 +12,12 @@ import grpc
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from varon_fi.proto.varon_fi_pb2 import (
-    MarketData,
-    DataSubscription,
+    OHLC,
     Trade,
     OrderBookSnapshot,
     OrderBookLevel,
+    DataSubscription,
+    TraceContext,
 )
 from varon_fi.proto.varon_fi_pb2_grpc import (
     DataServiceServicer,
@@ -29,11 +30,13 @@ class MockDataService(DataServiceServicer):
     
     def __init__(self):
         self.symbols = ['BTC', 'ETH']
+        self.timeframe = '5m'
         self.price_seeds = {'BTC': 50000.0, 'ETH': 3000.0}
         
-    async def StreamMarketData(self, request: DataSubscription, context):
+    async def StreamOHLC(self, request: DataSubscription, context):
         """Stream OHLC candles."""
         symbols = request.symbols if request.symbols else self.symbols
+        timeframe = request.timeframe if request.timeframe else self.timeframe
         
         while True:
             for symbol in symbols:
@@ -46,15 +49,22 @@ class MockDataService(DataServiceServicer):
                 timestamp = Timestamp()
                 timestamp.FromDatetime(now)
                 
-                yield MarketData(
+                trace = TraceContext(
                     timestamp=timestamp,
+                    source_service="mock-dataservice",
+                )
+                
+                yield OHLC(
                     symbol=symbol,
+                    timeframe=timeframe,
+                    timestamp=timestamp,
                     open=price * 0.998,
                     high=price * 1.002,
                     low=price * 0.997,
                     close=price,
                     volume=100.0,
-                    source="mock",
+                    count=50,
+                    trace=trace,
                 )
             
             # Emit every 5 seconds
@@ -69,11 +79,6 @@ class MockDataService(DataServiceServicer):
         """Stream order book snapshots."""
         while True:
             await asyncio.sleep(1)
-    
-    async def GetHistoricalData(self, request, context):
-        """Get historical data."""
-        from varon_fi.proto.varon_fi_pb2 import HistoricalDataResponse
-        return HistoricalDataResponse()
 
 
 async def serve(port: int = 50051):

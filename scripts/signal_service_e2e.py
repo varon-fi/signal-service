@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 from signal_service.config.settings import Settings
 from signal_service.grpc.server import SignalServiceServer
 from signal_service.grpc.client import DataServiceClient
-from signal_service.grpc.execution_client import ExecutionServiceClient
 from signal_service.strategy.engine import StrategyEngine
 
 load_dotenv()
@@ -28,9 +27,7 @@ async def main():
     engine = StrategyEngine(settings.database_url)
     await engine.initialize()
     
-    # Connect to ExecutionService for forwarding signals
-    execution_client = ExecutionServiceClient(settings.executionservice_addr)
-    await execution_client.connect()
+    # Connect to ExecutionService for forwarding signals (via engine)
     await engine.connect_execution_service(settings.executionservice_addr)
     
     # Connect to DataService
@@ -56,7 +53,6 @@ async def main():
     finally:
         await server.stop()
         await data_client.disconnect()
-        await execution_client.disconnect()
         await engine.shutdown()
 
 

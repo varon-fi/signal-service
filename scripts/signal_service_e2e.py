@@ -106,6 +106,7 @@ async def run_with_db_engine(settings: Settings):
     # Connect to ExecutionService for forwarding signals
     execution_client = ExecutionServiceClient(settings.executionservice_addr)
     await execution_client.connect()
+    engine.execution_client = execution_client
     print(f"[OK] Connected to ExecutionService at {settings.executionservice_addr}")
 
     # Connect to DataService

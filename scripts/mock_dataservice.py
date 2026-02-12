@@ -87,12 +87,15 @@ class MockDataService(DataServiceServicer):
 
 async def serve(port: int = 50051):
     """Start the mock DataService server."""
+    # Reuse same instance for both server and info display
+    mock_service = MockDataService()
+    
     server = grpc.aio.server()
-    add_DataServiceServicer_to_server(MockDataService(), server)
+    add_DataServiceServicer_to_server(mock_service, server)
     server.add_insecure_port(f'[::]:{port}')
     await server.start()
     print(f"Mock DataService running on port {port}")
-    print(f"Emitting OHLC for: {MockDataService().symbols}")
+    print(f"Emitting OHLC for: {mock_service.symbols}")
     await server.wait_for_termination()
 
 

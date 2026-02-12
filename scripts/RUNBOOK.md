@@ -45,12 +45,28 @@ Waiting for OrderRequests from Signal Service...
 
 ### 3. Start Signal Service E2E Runner
 
+#### Option A: Mock Mode (No Database Required - Recommended)
+
 ```bash
 # Optional: set environment variables
 export DATASERVICE_GRPC_ADDR="localhost:50051"
 export EXECUTIONSERVICE_GRPC_ADDR="localhost:50053"
 export SIGNALSERVICE_GRPC_PORT="50052"
 
+# Run with mock engine (no database needed)
+python scripts/signal_service_e2e.py --mock
+```
+
+#### Option B: With Database
+
+```bash
+# Ensure Postgres is running with seeded strategies table
+export DATABASE_URL="postgresql://postgres@localhost/varon_fi"
+export DATASERVICE_GRPC_ADDR="localhost:50051"
+export EXECUTIONSERVICE_GRPC_ADDR="localhost:50053"
+export SIGNALSERVICE_GRPC_PORT="50052"
+
+# Run with database-backed engine
 python scripts/signal_service_e2e.py
 ```
 

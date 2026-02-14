@@ -10,6 +10,7 @@ class Settings:
     database_url: str
     dataservice_addr: str
     signalservice_port: int
+    trading_mode: str = "live"
     
     # OHLC subscription defaults
     default_symbols: list[str] = None
@@ -20,3 +21,4 @@ class Settings:
             object.__setattr__(self, 'default_symbols', ['BTC', 'ETH', 'SOL', 'XRP', 'HYPER'])
         if self.default_timeframes is None:
             object.__setattr__(self, 'default_timeframes', ['5m'])
+        object.__setattr__(self, 'trading_mode', self.trading_mode.lower())

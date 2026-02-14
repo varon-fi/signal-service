@@ -5,10 +5,12 @@ from typing import Optional
 import pandas as pd
 import talib
 
-from signal_service.strategy.base import BaseStrategy, Signal
+from varon_fi import BaseStrategy, Signal, register
 
 
+@register
 class MtfConfluenceStrategy(BaseStrategy):
+    name = "mtf_confluence"
     """
     Multi-Timeframe Confluence Strategy - Live Version
     

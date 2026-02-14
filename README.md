@@ -43,3 +43,8 @@ python -m signal_service.main
 - `DATABASE_URL` — Postgres connection string
 - `DATASERVICE_GRPC_ADDR` — DataService gRPC endpoint (default: localhost:50051)
 - `SIGNALSERVICE_GRPC_PORT` — Port to expose SignalService (default: 50052)
+- `SIGNALSERVICE_TRADING_MODE` — Strategy mode filter (`live` or `paper`, default: `live`)
+
+## Strategy Loading
+- Strategies are loaded from Postgres on startup (filtered by mode + active flags).
+- To apply strategy config changes, restart the service (no hot-reload wired yet).

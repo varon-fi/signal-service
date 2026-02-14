@@ -6,7 +6,7 @@ from typing import Optional
 import grpc
 from structlog import get_logger
 
-from signal_service.strategy.base import Signal
+from varon_fi import Signal
 from signal_service.strategy.engine import StrategyEngine
 
 logger = get_logger(__name__)

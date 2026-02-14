@@ -20,10 +20,11 @@ async def main():
         database_url=os.getenv("DATABASE_URL", "postgresql://postgres@localhost/varon_fi"),
         dataservice_addr=os.getenv("DATASERVICE_GRPC_ADDR", "localhost:50051"),
         signalservice_port=int(os.getenv("SIGNALSERVICE_GRPC_PORT", "50052")),
+        trading_mode=os.getenv("SIGNALSERVICE_TRADING_MODE", "live"),
     )
     
     # Initialize strategy engine (loads strategies from DB)
-    engine = StrategyEngine(settings.database_url)
+    engine = StrategyEngine(settings.database_url, mode=settings.trading_mode)
     await engine.initialize()
     
     # Connect to DataService

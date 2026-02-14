@@ -182,16 +182,16 @@ class StrategyEngine:
         )
         
     async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200) -> pd.DataFrame:
-        """Fetch recent OHLC history from database."""
+        """Fetch recent OHLC history from database for symbol and timeframe."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT ts as timestamp, open, high, low, close, volume
                 FROM ohlcs o
                 JOIN instruments i ON o.instrument_id = i.id
-                WHERE i.symbol = $1
+                WHERE i.symbol = $1 AND o.timeframe = $2
                 ORDER BY ts DESC
-                LIMIT $2
-            """, symbol, bars)
+                LIMIT $3
+            """, symbol, timeframe, bars)
             
         df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df = df.sort_values('timestamp').reset_index(drop=True)

@@ -4,7 +4,7 @@ import pytest
 import pandas as pd
 import numpy as np
 
-from signal_service.strategy.base import Signal, BaseStrategy
+from varon_fi import Signal
 from signal_service.strategy.mtf_confluence import MtfConfluenceStrategy
 
 

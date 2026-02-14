@@ -10,7 +10,8 @@ from structlog import get_logger
 from google.protobuf.timestamp_pb2 import Timestamp
 from datetime import datetime, timezone
 
-from signal_service.strategy.base import BaseStrategy, Signal
+import signal_service.strategy  # registers built-in strategies
+from varon_fi import BaseStrategy, Signal, StrategyConfig, create_strategy, list_strategies
 from signal_service.grpc.execution_client import ExecutionServiceClient
 from varon_fi.proto.varon_fi_pb2 import TradeSignal, TradingMode, TraceContext
 
@@ -21,14 +22,16 @@ class StrategyEngine:
     """Manages live strategies and generates signals."""
     
     def __init__(
-        self, 
+        self,
         database_url: str,
         execution_client: Optional[ExecutionServiceClient] = None,
+        mode: str = "live",
     ):
         self.database_url = database_url
         self.pool: Optional[asyncpg.Pool] = None
         self.strategies: dict[str, BaseStrategy] = {}
         self.execution_client = execution_client
+        self.mode = mode.lower()
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -41,15 +44,21 @@ class StrategyEngine:
         self.pool = await asyncpg.create_pool(self.database_url)
         await self._load_strategies()
         logger.info("StrategyEngine initialized", strategy_count=len(self.strategies))
+
+    async def reload_strategies(self):
+        """Reload strategies from the database."""
+        self.strategies.clear()
+        await self._load_strategies()
+        logger.info("Strategies reloaded", strategy_count=len(self.strategies))
         
     async def _load_strategies(self):
-        """Load active live strategies from database."""
+        """Load active strategies from database for the configured mode."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT id, name, type, params, symbols, timeframes, strategy_version
+                SELECT id, name, type, params, symbols, timeframes, version, mode, is_live, status
                 FROM strategies
-                WHERE is_live = true AND status = 'active'
-            """)
+                WHERE is_live = true AND status = 'active' AND mode = $1
+            """, self.mode)
             
         for row in rows:
             strategy = self._create_strategy(row)
@@ -58,27 +67,40 @@ class StrategyEngine:
                 
     def _create_strategy(self, row: asyncpg.Record) -> Optional[BaseStrategy]:
         """Instantiate a strategy from DB row."""
-        from signal_service.strategy.mtf_confluence import MtfConfluenceStrategy
-        
-        strategy_map = {
-            'mtf_confluence': MtfConfluenceStrategy,
-            # Add more strategy types here
-        }
-        
-        strategy_class = strategy_map.get(row['name'])
-        if not strategy_class:
-            logger.warning("Unknown strategy type", name=row['name'])
+        name = row.get("name") if isinstance(row, dict) else row["name"]
+        if not name:
+            logger.warning("Strategy missing name", row=row)
             return None
-            
-        params = json.loads(row['params']) if isinstance(row['params'], str) else row['params']
-        return strategy_class(
-            strategy_id=str(row['id']),
-            name=row['name'],
-            version=row['strategy_version'],
-            symbols=row['symbols'],
-            timeframes=row['timeframes'],
-            params=params,
-        )
+
+        raw_params = row.get("params") if isinstance(row, dict) else row["params"]
+        if raw_params is None:
+            logger.warning("Strategy missing params; defaulting to empty", name=name)
+            params = {}
+        else:
+            params = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+
+        version = row.get("version") if isinstance(row, dict) else row["version"]
+        if not version:
+            logger.warning("Strategy missing version; defaulting to 1.0.0", name=name)
+            version = "1.0.0"
+
+        config = StrategyConfig(name=name, params=params)
+        try:
+            return create_strategy(
+                config,
+                strategy_id=str(row["id"]),
+                name=name,
+                version=version,
+                symbols=row["symbols"],
+                timeframes=row["timeframes"],
+            )
+        except KeyError:
+            logger.warning(
+                "Unknown strategy type",
+                name=name,
+                available=list(list_strategies().keys()),
+            )
+            return None
         
     async def process_candle(self, ohlc: dict) -> Optional[Signal]:
         """Process an OHLC candle and return signal if generated."""
@@ -132,7 +154,8 @@ class StrategyEngine:
         timestamp.FromDatetime(now)
 
         # Convert mode string to TradingMode enum
-        mode_str = (signal.meta.get("mode", "live") if signal.meta else "live").lower()
+        mode_str = (signal.meta.get("mode") if signal.meta else None) or self.mode
+        mode_str = str(mode_str).lower()
         mode = TradingMode.LIVE if mode_str == "live" else TradingMode.PAPER
 
         # Build TraceContext with correlation and idempotency keys
@@ -159,13 +182,14 @@ class StrategyEngine:
         )
         
     async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200) -> pd.DataFrame:
-        """Fetch recent OHLC history from database."""
+        """Fetch recent OHLC history from database for symbol and timeframe."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT timestamp, open, high, low, close, volume
-                FROM ohlc
-                WHERE symbol = $1 AND timeframe = $2
-                ORDER BY timestamp DESC
+                SELECT ts as timestamp, open, high, low, close, volume
+                FROM ohlcs o
+                JOIN instruments i ON o.instrument_id = i.id
+                WHERE i.symbol = $1 AND o.timeframe = $2
+                ORDER BY ts DESC
                 LIMIT $3
             """, symbol, timeframe, bars)
             
@@ -176,15 +200,30 @@ class StrategyEngine:
     async def _persist_signal(self, signal: Signal):
         """Persist signal to database."""
         async with self.pool.acquire() as conn:
+            # Map symbol to instrument_id (Hyperliquid = exchange_id 1)
+            instrument_id = await conn.fetchval("""
+                SELECT id FROM instruments WHERE symbol = $1
+            """, signal.symbol)
+            
+            if instrument_id is None:
+                logger.warning("Unknown instrument for signal", symbol=signal.symbol)
+                return
+            
+            # Map side to signal_type/signal_value
+            signal_type = signal.side.upper() if signal.side else "UNKNOWN"
+            signal_value = float(signal.price) if signal.price else 0.0
+            
             await conn.execute("""
                 INSERT INTO signals 
-                (strategy_id, strategy_version, symbol, timeframe, side, 
-                 price, confidence, meta, mode, idempotency_key, correlation_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'live', $9, $10)
+                (exchange_id, instrument_id, strategy_id, strategy_version,
+                 signal_type, signal_value, confidence, payload, mode, 
+                 idempotency_key, correlation_id)
+                VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             """,
-            signal.strategy_id, signal.strategy_version, signal.symbol,
-            signal.timeframe, signal.side, signal.price, signal.confidence,
-            json.dumps(signal.meta), signal.idempotency_key, signal.correlation_id)
+            instrument_id, signal.strategy_id, signal.strategy_version,
+            signal_type, signal_value, signal.confidence,
+            json.dumps(signal.meta), self.mode, 
+            signal.idempotency_key, signal.correlation_id)
             
     async def shutdown(self):
         """Cleanup resources."""

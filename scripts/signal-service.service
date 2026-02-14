@@ -1,0 +1,18 @@
+[Unit]
+Description=Signal Service - Real-time trading signal generation
+After=network-online.target hyperliquid-integrated.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=varon
+Group=varon
+WorkingDirectory=/home/varon/.openclaw/workspace/signal-service
+Environment=PYTHONPATH=/home/varon/.openclaw/workspace/signal-service/src
+EnvironmentFile=/etc/signal-service.env
+ExecStart=/opt/venv/signal-service/bin/python -m signal_service.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

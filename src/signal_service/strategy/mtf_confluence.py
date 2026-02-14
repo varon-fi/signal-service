@@ -5,10 +5,12 @@ from typing import Optional
 import pandas as pd
 import talib
 
-from signal_service.strategy.base import BaseStrategy, Signal
+from varon_fi import BaseStrategy, Signal, register
 
 
+@register
 class MtfConfluenceStrategy(BaseStrategy):
+    name = "mtf_confluence"
     """
     Multi-Timeframe Confluence Strategy - Live Version
     
@@ -24,6 +26,17 @@ class MtfConfluenceStrategy(BaseStrategy):
         """Process new candle and return signal if conditions met."""
         if len(history) < 200:
             return None
+            
+        # Convert Decimal columns to float for TA-Lib compatibility
+        history = history.copy()
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in history.columns:
+                history[col] = history[col].astype(float)
+        
+        # Convert numeric candle values to float
+        numeric_fields = {'open', 'high', 'low', 'close', 'volume', 'price'}
+        candle = {k: float(v) if k in numeric_fields and v is not None else v 
+                  for k, v in candle.items()}
             
         # Parameters
         htf_ema_len = int(self.params.get("htf_ema_len", 50))

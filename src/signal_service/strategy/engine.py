@@ -185,12 +185,13 @@ class StrategyEngine:
         """Fetch recent OHLC history from database."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT timestamp, open, high, low, close, volume
-                FROM ohlc
-                WHERE symbol = $1 AND timeframe = $2
-                ORDER BY timestamp DESC
-                LIMIT $3
-            """, symbol, timeframe, bars)
+                SELECT ts as timestamp, open, high, low, close, volume
+                FROM ohlcs o
+                JOIN instruments i ON o.instrument_id = i.id
+                WHERE i.symbol = $1
+                ORDER BY ts DESC
+                LIMIT $2
+            """, symbol, bars)
             
         df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -199,15 +200,30 @@ class StrategyEngine:
     async def _persist_signal(self, signal: Signal):
         """Persist signal to database."""
         async with self.pool.acquire() as conn:
+            # Map symbol to instrument_id (Hyperliquid = exchange_id 1)
+            instrument_id = await conn.fetchval("""
+                SELECT id FROM instruments WHERE symbol = $1
+            """, signal.symbol)
+            
+            if instrument_id is None:
+                logger.warning("Unknown instrument for signal", symbol=signal.symbol)
+                return
+            
+            # Map side to signal_type/signal_value
+            signal_type = signal.side.upper() if signal.side else "UNKNOWN"
+            signal_value = float(signal.price) if signal.price else 0.0
+            
             await conn.execute("""
                 INSERT INTO signals 
-                (strategy_id, strategy_version, symbol, timeframe, side, 
-                 price, confidence, meta, mode, idempotency_key, correlation_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                (exchange_id, instrument_id, strategy_id, strategy_version,
+                 signal_type, signal_value, confidence, payload, mode, 
+                 idempotency_key, correlation_id)
+                VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             """,
-            signal.strategy_id, signal.strategy_version, signal.symbol,
-            signal.timeframe, signal.side, signal.price, signal.confidence,
-            json.dumps(signal.meta), self.mode, signal.idempotency_key, signal.correlation_id)
+            instrument_id, signal.strategy_id, signal.strategy_version,
+            signal_type, signal_value, signal.confidence,
+            json.dumps(signal.meta), self.mode, 
+            signal.idempotency_key, signal.correlation_id)
             
     async def shutdown(self):
         """Cleanup resources."""

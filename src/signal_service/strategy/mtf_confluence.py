@@ -27,6 +27,17 @@ class MtfConfluenceStrategy(BaseStrategy):
         if len(history) < 200:
             return None
             
+        # Convert Decimal columns to float for TA-Lib compatibility
+        history = history.copy()
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col in history.columns:
+                history[col] = history[col].astype(float)
+        
+        # Convert numeric candle values to float
+        numeric_fields = {'open', 'high', 'low', 'close', 'volume', 'price'}
+        candle = {k: float(v) if k in numeric_fields and v is not None else v 
+                  for k, v in candle.items()}
+            
         # Parameters
         htf_ema_len = int(self.params.get("htf_ema_len", 50))
         htf_rsi_len = int(self.params.get("htf_rsi_len", 14))

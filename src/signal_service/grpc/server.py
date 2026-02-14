@@ -34,7 +34,7 @@ class SignalServiceServer:
     async def stop(self):
         """Stop the gRPC server."""
         if self.server:
-            await self.server.stop(grace_period=5)
+            await self.server.stop(grace=5)
         logger.info("SignalService stopped")
         
     async def emit_signal(self, signal: Signal):

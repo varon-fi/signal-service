@@ -18,7 +18,6 @@ dependencies = [
     "ta-lib>=0.4.28",
     "python-dotenv>=1.0.0",
     "structlog>=23.0.0",
-    "varon-fi @ git+https://github.com/varon-fi/python.git@f18734f7b3352775f6f9efbdbd44f613d0e73b50",
 ]
 
 [project.optional-dependencies]

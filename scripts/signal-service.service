@@ -1,0 +1,21 @@
+[Unit]
+Description=Signal Service - Real-time trading signal generation
+After=network-online.target hyperliquid-integrated.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=varon
+Group=varon
+WorkingDirectory=/home/varon/.openclaw/workspace/signal-service
+Environment=PYTHONPATH=/home/varon/.openclaw/workspace/signal-service/src
+Environment=DATABASE_URL=postgresql://postgres:1UkEV99XLipoK8T8z4qJ@localhost:5432/varon_fi
+Environment=DATASERVICE_GRPC_ADDR=localhost:50051
+Environment=SIGNALSERVICE_GRPC_PORT=50052
+Environment=SIGNALSERVICE_TRADING_MODE=live
+ExecStart=/home/varon/.openclaw/agents/loretta/workspace/backtest/.venv/bin/python -m signal_service.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

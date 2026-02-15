@@ -1,11 +1,16 @@
 """MTF Confluence Strategy implementation for live trading."""
 
+from datetime import datetime, time
 from typing import Optional
 
 import pandas as pd
+import pytz
 import talib
+from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register
+
+logger = get_logger(__name__)
 
 
 @register
@@ -16,11 +21,47 @@ class MtfConfluenceStrategy(BaseStrategy):
     
     Uses 15m HTF for trend direction (EMA + RSI) and 5m LTF for entry precision.
     Enters on pullbacks in the direction of the higher timeframe trend.
+    
+    Session: 14:00-18:00 UTC (matches Pine Script)
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.htf_mult = 3  # 15m = 3x 5m candles
+        self.utc = pytz.UTC
+        # Session filter: 14:00-18:00 UTC (matches Pine Script)
+        self.session_start = time(14, 0)  # 14:00 UTC
+        self.session_end = time(18, 0)    # 18:00 UTC
+        
+    def _in_session(self, ts) -> bool:
+        """Check if timestamp is within trading session (14:00-18:00 UTC)."""
+        # Handle different timestamp types
+        if isinstance(ts, (int, float)):
+            # Unix timestamp (seconds)
+            ts = datetime.fromtimestamp(ts, self.utc)
+        elif hasattr(ts, 'seconds') and hasattr(ts, 'nanos'):  # Protobuf Timestamp
+            # Convert seconds to datetime (ignore nanos for session check)
+            ts = datetime.fromtimestamp(ts.seconds, self.utc)
+        elif isinstance(ts, str):
+            ts = pd.to_datetime(ts)
+        elif hasattr(ts, 'ToDatetime'):  # Protobuf Timestamp with ToDatetime method
+            ts = ts.ToDatetime(tzinfo=self.utc)
+        
+        # Ensure datetime
+        if not isinstance(ts, datetime):
+            return True  # Allow if we can't parse
+        
+        # Ensure timestamp is UTC
+        try:
+            if ts.tzinfo is None:
+                ts = self.utc.localize(ts)
+            else:
+                ts = ts.astimezone(self.utc)
+        except (AttributeError, ValueError):
+            pass
+        
+        current_time = ts.time()
+        return self.session_start <= current_time <= self.session_end
         
     def on_candle(self, candle: dict, history: pd.DataFrame) -> Optional[Signal]:
         """Process new candle and return signal if conditions met."""
@@ -37,6 +78,12 @@ class MtfConfluenceStrategy(BaseStrategy):
         numeric_fields = {'open', 'high', 'low', 'close', 'volume', 'price'}
         candle = {k: float(v) if k in numeric_fields and v is not None else v 
                   for k, v in candle.items()}
+        
+        # Session filter (14:00-18:00 UTC) - matches Pine Script
+        candle_ts = candle.get('timestamp') or candle.get('ts')
+        if candle_ts is not None:
+            if not self._in_session(candle_ts):
+                return None  # Outside trading session
             
         # Parameters
         htf_ema_len = int(self.params.get("htf_ema_len", 50))
@@ -111,6 +158,8 @@ class MtfConfluenceStrategy(BaseStrategy):
                     "htf_rsi": float(htf_rsi_val),
                     "ltf_ema": float(curr_ltf_ema),
                     "pullback": True,
+                    "in_session": True,
+                    "session": "14:00-18:00 UTC",
                 }
             )
             
@@ -124,6 +173,8 @@ class MtfConfluenceStrategy(BaseStrategy):
                     "htf_rsi": float(htf_rsi_val),
                     "ltf_ema": float(curr_ltf_ema),
                     "pullback": True,
+                    "in_session": True,
+                    "session": "14:00-18:00 UTC",
                 }
             )
             

@@ -18,7 +18,8 @@ dependencies = [
     "ta-lib>=0.4.28",
     "python-dotenv>=1.0.0",
     "structlog>=23.0.0",
-    "varon-fi @ file:///home/varon/.openclaw/workspace/python",
+    "pytz>=2024.1",
+    "varon-fi @ file:///home/varon/.openclaw/agents/varon/workspace/python",
 ]
 
 [project.optional-dependencies]

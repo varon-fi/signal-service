@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=varon
 Group=varon
-WorkingDirectory=/home/varon/.openclaw/workspace/signal-service
-Environment=PYTHONPATH=/home/varon/.openclaw/workspace/signal-service/src
+WorkingDirectory=/home/varon/.openclaw/agents/varon/workspace/signal-service
+Environment=PYTHONPATH=/home/varon/.openclaw/agents/varon/workspace/signal-service/src
 EnvironmentFile=/etc/signal-service.env
 ExecStart=/opt/venv/signal-service/bin/python -m signal_service.main
 Restart=always

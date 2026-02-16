@@ -31,6 +31,8 @@ class StrategyEngine:
         self.strategies: dict[str, BaseStrategy] = {}
         self.execution_client = execution_client
         self.mode = mode.lower()
+        self._last_signal_time: dict[str, datetime] = {}  # Cooldown tracking per strategy-symbol
+        self.signal_cooldown_minutes = 15  # Minimum minutes between signals from same strategy-symbol
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -109,6 +111,13 @@ class StrategyEngine:
         for strategy_id, strategy in self.strategies.items():
             if symbol not in strategy.symbols or timeframe not in strategy.timeframes:
                 continue
+            
+            # Check cooldown - prevent signal spam
+            cooldown_key = f"{strategy_id}:{symbol}"
+            now = datetime.now(timezone.utc)
+            last_time = self._last_signal_time.get(cooldown_key)
+            if last_time and (now - last_time).total_seconds() < (self.signal_cooldown_minutes * 60):
+                continue  # Still in cooldown period
                 
             # Fetch recent history for this symbol/timeframe
             history = await self._fetch_history(symbol, timeframe, bars=200)
@@ -119,6 +128,9 @@ class StrategyEngine:
                 signal.strategy_version = strategy.version
                 signal.symbol = symbol
                 signal.timeframe = timeframe
+                
+                # Update cooldown tracker
+                self._last_signal_time[cooldown_key] = now
                 
                 # Persist to database
                 await self._persist_signal(signal)

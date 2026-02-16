@@ -14,7 +14,6 @@ import signal_service.strategy  # registers built-in strategies
 from varon_fi import BaseStrategy, Signal, StrategyConfig, create_strategy, list_strategies
 from signal_service.grpc.execution_client import ExecutionServiceClient
 from varon_fi.proto.varon_fi_pb2 import TradeSignal, TradingMode, TraceContext
-
 logger = get_logger(__name__)
 
 
@@ -177,7 +176,7 @@ class StrategyEngine:
             price=signal.price or 0.0,
             confidence=signal.confidence,
             mode=mode,
-            meta=signal.meta if signal.meta else {},
+            meta={str(k): "" if v is None else str(v) for k, v in signal.meta.items()} if signal.meta else {},
             trace=trace,
         )
         

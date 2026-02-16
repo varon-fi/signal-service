@@ -33,6 +33,8 @@ class StrategyEngine:
         self.mode = mode.lower()
         # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals
         self._last_candle_ts: dict[str, datetime] = {}
+        # Only process candles from service start time (skip historical backfill)
+        self._service_start_time = datetime.now(timezone.utc)
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -115,10 +117,16 @@ class StrategyEngine:
             # De-duplicate per candle: only process each candle once per strategy/symbol/timeframe
             candle_ts = self._normalize_candle_ts(ohlc.get('timestamp') or ohlc.get('ts'))
             if candle_ts is not None:
+                # Skip historical candles - only process from service start time
+                if candle_ts < self._service_start_time:
+                    logger.debug("Skipping historical candle", candle_ts=candle_ts.isoformat(), service_start=self._service_start_time.isoformat())
+                    continue
                 dedupe_key = f"{strategy_id}:{symbol}:{timeframe}"
                 last_ts = self._last_candle_ts.get(dedupe_key)
                 if last_ts is not None and candle_ts <= last_ts:
+                    logger.debug("Skipping duplicate candle", dedupe_key=dedupe_key, candle_ts=candle_ts.isoformat(), last_ts=last_ts.isoformat())
                     continue
+                logger.debug("Processing new candle", dedupe_key=dedupe_key, candle_ts=candle_ts.isoformat(), last_ts=last_ts.isoformat() if last_ts else None)
                 self._last_candle_ts[dedupe_key] = candle_ts
 
             # Fetch recent history for this symbol/timeframe

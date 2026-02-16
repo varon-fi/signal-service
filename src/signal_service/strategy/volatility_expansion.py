@@ -109,9 +109,10 @@ class VolatilityExpansionStrategy(BaseStrategy):
         # Squeeze detection (BB inside KC = low volatility)
         in_squeeze = (bb_upper < keltner_upper) & (bb_lower > keltner_lower)
         
-        # Count consecutive squeeze bars
+        # Count consecutive squeeze bars ending at the previous bar
+        # (since breakout requires curr_in_squeeze == False)
         squeeze_count = 0
-        for i in range(1, min(len(in_squeeze), 20)):
+        for i in range(2, min(len(in_squeeze) + 1, 21)):
             if in_squeeze[-i]:
                 squeeze_count += 1
             else:

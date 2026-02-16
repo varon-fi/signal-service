@@ -6,7 +6,6 @@ from typing import Optional
 import pandas as pd
 import pytz
 import talib
-import numpy as np
 from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register

@@ -99,8 +99,8 @@ class AtrBreakoutStrategy(BaseStrategy):
         highest_high = talib.MAX(highs, timeperiod=atr_length)
         lowest_low = talib.MIN(lows, timeperiod=atr_length)
         
-        upper_band = highest_high + atr * 0.5
-        lower_band = lowest_low - atr * 0.5
+        upper_band = highest_high + atr * atr_mult
+        lower_band = lowest_low - atr * atr_mult
         
         if pd.isna(upper_band[-1]) or pd.isna(ema[-1]):
             return None

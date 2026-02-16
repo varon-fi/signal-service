@@ -1,9 +1,14 @@
 """gRPC client for DataService."""
 
 from typing import AsyncIterator
+import sys
 
 import grpc
 from structlog import get_logger
+
+# Ensure compatibility with older generated gRPC modules
+from varon_fi.proto import varon_fi_pb2 as _varon_fi_pb2
+sys.modules.setdefault("varon_fi_pb2", _varon_fi_pb2)
 
 from varon_fi.proto.varon_fi_pb2 import DataSubscription
 from varon_fi.proto.varon_fi_pb2_grpc import DataServiceStub

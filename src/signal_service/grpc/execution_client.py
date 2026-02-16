@@ -2,12 +2,16 @@
 
 from typing import Optional
 import uuid
+import sys
 
 import grpc
 from structlog import get_logger
 from google.protobuf.timestamp_pb2 import Timestamp
 
 # Import from varon-fi package
+from varon_fi.proto import varon_fi_pb2 as _varon_fi_pb2
+sys.modules.setdefault("varon_fi_pb2", _varon_fi_pb2)
+
 from varon_fi.proto.varon_fi_pb2 import (
     TradeSignal,
     OrderRequest,

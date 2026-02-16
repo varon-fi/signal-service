@@ -31,8 +31,8 @@ class StrategyEngine:
         self.strategies: dict[str, BaseStrategy] = {}
         self.execution_client = execution_client
         self.mode = mode.lower()
-        self._last_signal_time: dict[str, datetime] = {}  # Cooldown tracking per strategy-symbol
-        self.signal_cooldown_minutes = 15  # Minimum minutes between signals from same strategy-symbol
+        # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals
+        self._last_candle_ts: dict[str, datetime] = {}
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -112,13 +112,15 @@ class StrategyEngine:
             if symbol not in strategy.symbols or timeframe not in strategy.timeframes:
                 continue
             
-            # Check cooldown - prevent signal spam
-            cooldown_key = f"{strategy_id}:{symbol}"
-            now = datetime.now(timezone.utc)
-            last_time = self._last_signal_time.get(cooldown_key)
-            if last_time and (now - last_time).total_seconds() < (self.signal_cooldown_minutes * 60):
-                continue  # Still in cooldown period
-                
+            # De-duplicate per candle: only process each candle once per strategy/symbol/timeframe
+            candle_ts = self._normalize_candle_ts(ohlc.get('timestamp') or ohlc.get('ts'))
+            if candle_ts is not None:
+                dedupe_key = f"{strategy_id}:{symbol}:{timeframe}"
+                last_ts = self._last_candle_ts.get(dedupe_key)
+                if last_ts is not None and candle_ts <= last_ts:
+                    continue
+                self._last_candle_ts[dedupe_key] = candle_ts
+
             # Fetch recent history for this symbol/timeframe
             history = await self._fetch_history(symbol, timeframe, bars=200)
             
@@ -128,9 +130,6 @@ class StrategyEngine:
                 signal.strategy_version = strategy.version
                 signal.symbol = symbol
                 signal.timeframe = timeframe
-                
-                # Update cooldown tracker
-                self._last_signal_time[cooldown_key] = now
                 
                 # Persist to database
                 await self._persist_signal(signal)
@@ -157,6 +156,37 @@ class StrategyEngine:
                 return signal
                 
         return None
+
+    def _normalize_candle_ts(self, ts) -> Optional[datetime]:
+        """Normalize candle timestamp to timezone-aware UTC datetime."""
+        if ts is None:
+            return None
+
+        # Handle different timestamp types
+        if isinstance(ts, (int, float)):
+            dt = datetime.fromtimestamp(ts, timezone.utc)
+        elif isinstance(ts, datetime):
+            dt = ts
+        elif hasattr(ts, 'seconds') and hasattr(ts, 'nanos'):
+            dt = datetime.fromtimestamp(ts.seconds, timezone.utc)
+        elif isinstance(ts, str):
+            dt = pd.to_datetime(ts)
+        elif hasattr(ts, 'ToDatetime'):
+            dt = ts.ToDatetime(tzinfo=timezone.utc)
+        else:
+            return None
+
+        # Convert pandas Timestamp to datetime if needed
+        if isinstance(dt, pd.Timestamp):
+            dt = dt.to_pydatetime()
+
+        # Ensure UTC timezone
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+
+        return dt
         
     def _to_trade_signal(self, signal: Signal) -> TradeSignal:
         """Convert internal Signal to TradeSignal protobuf matching PR#7 proto."""

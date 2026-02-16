@@ -35,6 +35,10 @@ class StrategyEngine:
         self._last_candle_ts: dict[str, datetime] = {}
         # Only process candles from service start time (skip historical backfill)
         self._service_start_time = datetime.now(timezone.utc)
+        # Track warmup status per strategy/symbol/timeframe (requirement #2)
+        # Key: f"{strategy_id}:{symbol}:{timeframe}", Value: min_bars_required
+        self._min_bars_required: dict[str, int] = {}
+        self._warmup_complete: dict[str, bool] = {}
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -54,6 +58,39 @@ class StrategyEngine:
         await self._load_strategies()
         logger.info("Strategies reloaded", strategy_count=len(self.strategies))
         
+    def _get_min_bars_for_strategy(self, strategy: BaseStrategy) -> int:
+        """Determine minimum bars required for strategy indicators.
+        
+        Checks strategy params for indicator periods and returns the maximum.
+        Default is 200 bars (covers most standard indicators).
+        """
+        # Default minimum for standard EMA/RSI strategies
+        default_min = 200
+        
+        if not hasattr(strategy, 'params') or strategy.params is None:
+            return default_min
+            
+        params = strategy.params
+        periods = []
+        
+        # Check common indicator period keys
+        for key in ['ema_period', 'ema_fast', 'ema_slow', 'rsi_period', 
+                    'atr_period', 'bb_period', 'volume_ma_period',
+                    'htf_ema_period', 'htf_rsi_period']:
+            if key in params:
+                periods.append(params[key])
+        
+        # Handle HTF multiplier for multi-timeframe strategies
+        if hasattr(strategy, 'htf_mult') and 'htf_ema_period' in params:
+            periods.append(params['htf_ema_period'] * strategy.htf_mult)
+            
+        if periods:
+            max_period = max(periods)
+            # Add buffer for lookback (e.g., EMA needs period * 2 for stability)
+            return max(default_min, max_period * 2)
+            
+        return default_min
+    
     async def _load_strategies(self):
         """Load active strategies from database for the configured mode."""
         async with self.pool.acquire() as conn:
@@ -66,7 +103,21 @@ class StrategyEngine:
         for row in rows:
             strategy = self._create_strategy(row)
             if strategy:
-                self.strategies[str(row['id'])] = strategy
+                strategy_id = str(row['id'])
+                self.strategies[strategy_id] = strategy
+                # Initialize warmup tracking for each strategy/symbol/timeframe combo
+                for symbol in strategy.symbols:
+                    for timeframe in strategy.timeframes:
+                        warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+                        # Determine minimum bars needed from strategy
+                        min_bars = self._get_min_bars_for_strategy(strategy)
+                        self._min_bars_required[warmup_key] = min_bars
+                        self._warmup_complete[warmup_key] = False
+                        logger.info("Strategy warmup initialized", 
+                                  strategy=strategy.name, 
+                                  symbol=symbol, 
+                                  timeframe=timeframe,
+                                  min_bars=min_bars)
                 
     def _create_strategy(self, row: asyncpg.Record) -> Optional[BaseStrategy]:
         """Instantiate a strategy from DB row."""
@@ -117,20 +168,31 @@ class StrategyEngine:
             # De-duplicate per candle: only process each candle once per strategy/symbol/timeframe
             candle_ts = self._normalize_candle_ts(ohlc.get('timestamp') or ohlc.get('ts'))
             if candle_ts is not None:
-                # Skip historical candles - only process from service start time
-                if candle_ts < self._service_start_time:
-                    logger.debug("Skipping historical candle", candle_ts=candle_ts.isoformat(), service_start=self._service_start_time.isoformat())
-                    continue
                 dedupe_key = f"{strategy_id}:{symbol}:{timeframe}"
                 last_ts = self._last_candle_ts.get(dedupe_key)
                 if last_ts is not None and candle_ts <= last_ts:
+                    # Already processed this candle timestamp for this strategy
                     logger.debug("Skipping duplicate candle", dedupe_key=dedupe_key, candle_ts=candle_ts.isoformat(), last_ts=last_ts.isoformat())
                     continue
-                logger.debug("Processing new candle", dedupe_key=dedupe_key, candle_ts=candle_ts.isoformat(), last_ts=last_ts.isoformat() if last_ts else None)
                 self._last_candle_ts[dedupe_key] = candle_ts
 
             # Fetch recent history for this symbol/timeframe
-            history = await self._fetch_history(symbol, timeframe, bars=200)
+            warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+            min_bars = self._min_bars_required.get(warmup_key, 200)
+            history = await self._fetch_history(symbol, timeframe, bars=max(200, min_bars))
+            
+            # Check warmup status (requirement #2)
+            if not self._warmup_complete.get(warmup_key, True):
+                if len(history) < min_bars:
+                    logger.debug("Skipping signal - warmup in progress", 
+                               strategy=strategy.name, symbol=symbol, timeframe=timeframe,
+                               history_bars=len(history), required_bars=min_bars)
+                    continue
+                else:
+                    self._warmup_complete[warmup_key] = True
+                    logger.info("Strategy warmup complete", 
+                              strategy=strategy.name, symbol=symbol, timeframe=timeframe,
+                              history_bars=len(history))
             
             signal = strategy.on_candle(ohlc, history)
             if signal:

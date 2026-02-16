@@ -32,6 +32,10 @@ class MtfConfluenceStrategy(BaseStrategy):
         # Session filter: 14:00-18:00 UTC (matches Pine Script)
         self.session_start = time(14, 0)  # 14:00 UTC
         self.session_end = time(18, 0)    # 18:00 UTC
+        # Position tracking - only generate entry signals when flat
+        self._position_side = None  # None = flat, "long", or "short"
+        self._entry_price = None
+        self._bars_since_entry = 0
         
     def _in_session(self, ts) -> bool:
         """Check if timestamp is within trading session (14:00-18:00 UTC)."""
@@ -64,7 +68,11 @@ class MtfConfluenceStrategy(BaseStrategy):
         return self.session_start <= current_time <= self.session_end
         
     def on_candle(self, candle: dict, history: pd.DataFrame) -> Optional[Signal]:
-        """Process new candle and return signal if conditions met."""
+        """Process new candle and return signal if conditions met.
+        
+        Only generates entry signals when flat (no position).
+        Tracks position state internally to prevent signal spam.
+        """
         if len(history) < 200:
             return None
             
@@ -124,6 +132,59 @@ class MtfConfluenceStrategy(BaseStrategy):
         htf_bullish = (htf_close > htf_ema_val) and (htf_rsi_val > htf_rsi_mid)
         htf_bearish = (htf_close < htf_ema_val) and (htf_rsi_val < htf_rsi_mid)
         
+        # Increment bars since entry
+        if self._position_side is not None:
+            self._bars_since_entry += 1
+        
+        # Check for exit conditions if in a position
+        if self._position_side == "long":
+            # Exit on trend reversal or stop loss
+            stop_loss_hit = self._entry_price and curr_close < self._entry_price * 0.995  # 0.5% stop
+            trend_reversed = htf_bearish  # HTF turned bearish
+            
+            if stop_loss_hit or trend_reversed:
+                self._position_side = None
+                self._entry_price = None
+                self._bars_since_entry = 0
+                return Signal(
+                    side="flat",
+                    price=curr_close,
+                    confidence=0.7,
+                    meta={
+                        "exit_reason": "stop_loss" if stop_loss_hit else "trend_reversal",
+                        "htf_ema": float(htf_ema_val),
+                        "htf_rsi": float(htf_rsi_val),
+                        "entry_price": self._entry_price,
+                    }
+                )
+            return None  # Stay in position
+            
+        if self._position_side == "short":
+            # Exit on trend reversal or stop loss
+            stop_loss_hit = self._entry_price and curr_close > self._entry_price * 1.005  # 0.5% stop
+            trend_reversed = htf_bullish  # HTF turned bullish
+            
+            if stop_loss_hit or trend_reversed:
+                self._position_side = None
+                self._entry_price = None
+                self._bars_since_entry = 0
+                return Signal(
+                    side="flat",
+                    price=curr_close,
+                    confidence=0.7,
+                    meta={
+                        "exit_reason": "stop_loss" if stop_loss_hit else "trend_reversal",
+                        "htf_ema": float(htf_ema_val),
+                        "htf_rsi": float(htf_rsi_val),
+                        "entry_price": self._entry_price,
+                    }
+                )
+            return None  # Stay in position
+        
+        # Only check entry conditions if flat (no position)
+        if self._position_side is not None:
+            return None
+            
         if not (htf_bullish or htf_bearish):
             return None
             
@@ -149,6 +210,9 @@ class MtfConfluenceStrategy(BaseStrategy):
         short_cond = htf_bearish and pullback_short and (curr_close < curr_ltf_ema)
         
         if long_cond:
+            self._position_side = "long"
+            self._entry_price = curr_close
+            self._bars_since_entry = 0
             return Signal(
                 side="long",
                 price=curr_close,
@@ -160,10 +224,14 @@ class MtfConfluenceStrategy(BaseStrategy):
                     "pullback": True,
                     "in_session": True,
                     "session": "14:00-18:00 UTC",
+                    "entry": True,
                 }
             )
             
         if short_cond:
+            self._position_side = "short"
+            self._entry_price = curr_close
+            self._bars_since_entry = 0
             return Signal(
                 side="short",
                 price=curr_close,
@@ -175,6 +243,7 @@ class MtfConfluenceStrategy(BaseStrategy):
                     "pullback": True,
                     "in_session": True,
                     "session": "14:00-18:00 UTC",
+                    "entry": True,
                 }
             )
             

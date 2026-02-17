@@ -33,6 +33,11 @@ class StrategyEngine:
         self.mode = mode.lower()
         # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals
         self._last_candle_ts: dict[str, datetime] = {}
+        # Track warmup requirements per strategy/symbol/timeframe
+        self._warmup_required: dict[str, int] = {}
+        self._warmup_complete: dict[str, bool] = {}
+        # Track latest candle timestamp seen at startup per symbol/timeframe
+        self._startup_latest_ts: dict[str, datetime] = {}
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -44,27 +49,45 @@ class StrategyEngine:
         """Initialize DB connection and load active strategies."""
         self.pool = await asyncpg.create_pool(self.database_url)
         await self._load_strategies()
+        await self._initialize_startup_state()
         logger.info("StrategyEngine initialized", strategy_count=len(self.strategies))
 
     async def reload_strategies(self):
         """Reload strategies from the database."""
         self.strategies.clear()
+        self._warmup_required.clear()
+        self._warmup_complete.clear()
         await self._load_strategies()
+        await self._initialize_startup_state()
         logger.info("Strategies reloaded", strategy_count=len(self.strategies))
         
     async def _load_strategies(self):
         """Load active strategies from database for the configured mode."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT id, name, type, params, symbols, timeframes, version, mode, is_live, status
+                SELECT *
                 FROM strategies
-                WHERE is_live = true AND status = 'active' AND mode = $1
+                WHERE status = 'active' AND mode = $1
             """, self.mode)
             
         for row in rows:
             strategy = self._create_strategy(row)
             if strategy:
-                self.strategies[str(row['id'])] = strategy
+                strategy_id = str(row['id'])
+                self.strategies[strategy_id] = strategy
+                # Initialize warmup tracking for each strategy/symbol/timeframe combo
+                init_periods = row.get("init_periods") if isinstance(row, dict) else row.get("init_periods")
+                for symbol in strategy.symbols:
+                    for timeframe in strategy.timeframes:
+                        warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+                        required = int(init_periods) if init_periods else 0
+                        self._warmup_required[warmup_key] = required
+                        self._warmup_complete[warmup_key] = (required == 0)
+                        logger.info("Strategy warmup initialized",
+                                  strategy=strategy.name,
+                                  symbol=symbol,
+                                  timeframe=timeframe,
+                                  min_bars=required)
                 
     def _create_strategy(self, row: asyncpg.Record) -> Optional[BaseStrategy]:
         """Instantiate a strategy from DB row."""
@@ -102,6 +125,85 @@ class StrategyEngine:
                 available=list(list_strategies().keys()),
             )
             return None
+
+    async def _initialize_startup_state(self):
+        """Initialize startup gating and warmup state."""
+        if not self.strategies:
+            return
+
+        # Build unique symbol/timeframe combinations across strategies
+        combos: set[tuple[str, str]] = set()
+        for strategy in self.strategies.values():
+            for symbol in strategy.symbols:
+                for timeframe in strategy.timeframes:
+                    combos.add((symbol, timeframe))
+
+        # Record latest candle timestamp at startup per symbol/timeframe
+        async with self.pool.acquire() as conn:
+            for symbol, timeframe in combos:
+                row = await conn.fetchrow(
+                    """
+                    SELECT MAX(ts) as ts
+                    FROM ohlcs o
+                    JOIN instruments i ON o.instrument_id = i.id
+                    WHERE i.symbol = $1 AND o.timeframe = $2
+                    """,
+                    symbol, timeframe
+                )
+                if row and row["ts"]:
+                    self._startup_latest_ts[f"{symbol}:{timeframe}"] = row["ts"]
+
+        # Prime warmup state by fetching historical bars
+        for strategy_id, strategy in self.strategies.items():
+            for symbol in strategy.symbols:
+                for timeframe in strategy.timeframes:
+                    warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+                    required = self._warmup_required.get(warmup_key, 0)
+                    if required > 0:
+                        history = await self._fetch_history(symbol, timeframe, bars=required)
+                        if len(history) >= required:
+                            self._warmup_complete[warmup_key] = True
+                            logger.info("Strategy warmup complete",
+                                        strategy=strategy.name,
+                                        symbol=symbol,
+                                        timeframe=timeframe,
+                                        history_bars=len(history))
+                        else:
+                            self._warmup_complete[warmup_key] = False
+                            logger.info("Strategy warmup pending",
+                                        strategy=strategy.name,
+                                        symbol=symbol,
+                                        timeframe=timeframe,
+                                        history_bars=len(history),
+                                        required_bars=required)
+
+    def _in_strategy_session(self, strategy: BaseStrategy, candle_ts: Optional[datetime]) -> bool:
+        """Check per-strategy session window if available."""
+        if candle_ts is None:
+            return True
+
+        # Strategy-provided helper
+        if hasattr(strategy, "_in_session") and callable(getattr(strategy, "_in_session")):
+            try:
+                return bool(strategy._in_session(candle_ts))
+            except Exception:
+                return True
+
+        # Fallback to params or attributes
+        params = getattr(strategy, "params", None) or {}
+        session_start = params.get("session_start") or getattr(strategy, "session_start", None)
+        session_end = params.get("session_end") or getattr(strategy, "session_end", None)
+        if not session_start or not session_end:
+            return True
+
+        # Parse session times if given as strings ("HH:MM")
+        if isinstance(session_start, str):
+            session_start = datetime.strptime(session_start, "%H:%M").time()
+        if isinstance(session_end, str):
+            session_end = datetime.strptime(session_end, "%H:%M").time()
+
+        current_time = candle_ts.time()
+        return session_start <= current_time <= session_end
         
     async def process_candle(self, ohlc: dict) -> Optional[Signal]:
         """Process an OHLC candle and return signal if generated."""
@@ -112,8 +214,21 @@ class StrategyEngine:
             if symbol not in strategy.symbols or timeframe not in strategy.timeframes:
                 continue
             
-            # De-duplicate per candle: only process each candle once per strategy/symbol/timeframe
+            # Normalize candle timestamp
             candle_ts = self._normalize_candle_ts(ohlc.get('timestamp') or ohlc.get('ts'))
+
+            # Per-strategy session window enforcement (requirement #1)
+            if not self._in_strategy_session(strategy, candle_ts):
+                continue
+
+            # Live-candle gating: skip candles at or before startup latest ts (requirement #3)
+            if candle_ts is not None:
+                startup_key = f"{symbol}:{timeframe}"
+                startup_ts = self._startup_latest_ts.get(startup_key)
+                if startup_ts is not None and candle_ts <= startup_ts:
+                    continue
+
+            # De-duplicate per candle: only process each candle once per strategy/symbol/timeframe
             if candle_ts is not None:
                 dedupe_key = f"{strategy_id}:{symbol}:{timeframe}"
                 last_ts = self._last_candle_ts.get(dedupe_key)
@@ -122,7 +237,22 @@ class StrategyEngine:
                 self._last_candle_ts[dedupe_key] = candle_ts
 
             # Fetch recent history for this symbol/timeframe
-            history = await self._fetch_history(symbol, timeframe, bars=200)
+            warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+            required = self._warmup_required.get(warmup_key, 0)
+            history = await self._fetch_history(symbol, timeframe, bars=max(200, required))
+
+            # Warmup check (requirement #2)
+            if required > 0 and not self._warmup_complete.get(warmup_key, True):
+                if len(history) < required:
+                    logger.debug("Skipping signal - warmup in progress",
+                               strategy=strategy.name, symbol=symbol, timeframe=timeframe,
+                               history_bars=len(history), required_bars=required)
+                    continue
+                else:
+                    self._warmup_complete[warmup_key] = True
+                    logger.info("Strategy warmup complete",
+                              strategy=strategy.name, symbol=symbol, timeframe=timeframe,
+                              history_bars=len(history))
             
             signal = strategy.on_candle(ohlc, history)
             if signal:

@@ -34,7 +34,7 @@ class StrategyEngine:
         # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals
         self._last_candle_ts: dict[str, datetime] = {}
         # Track warmup requirements per strategy/symbol/timeframe
-        self._min_bars_required: dict[str, int] = {}
+        self._warmup_required: dict[str, int] = {}
         self._warmup_complete: dict[str, bool] = {}
         # Track latest candle timestamp seen at startup per symbol/timeframe
         self._startup_latest_ts: dict[str, datetime] = {}
@@ -55,36 +55,11 @@ class StrategyEngine:
     async def reload_strategies(self):
         """Reload strategies from the database."""
         self.strategies.clear()
-        self._min_bars_required.clear()
+        self._warmup_required.clear()
         self._warmup_complete.clear()
         await self._load_strategies()
         await self._initialize_startup_state()
         logger.info("Strategies reloaded", strategy_count=len(self.strategies))
-
-    def _get_min_bars_for_strategy(self, strategy: BaseStrategy, init_periods: Optional[int]) -> int:
-        """Determine minimum bars required for strategy indicators.
-
-        Priority: explicit init_periods (DB) → derived from params → default 200.
-        """
-        if init_periods and int(init_periods) > 0:
-            return int(init_periods)
-
-        # Attempt to derive from common param keys
-        default_min = 200
-        params = getattr(strategy, 'params', None) or {}
-        keys = [
-            'ema_len', 'ema_period', 'ema_fast', 'ema_slow',
-            'rsi_len', 'rsi_period', 'atr_length', 'atr_period',
-            'bb_len', 'bb_period', 'keltner_len', 'lookback',
-            'volume_ma_period', 'htf_ema_len', 'htf_rsi_len', 'ltf_ema_len'
-        ]
-        periods = [params[k] for k in keys if k in params and isinstance(params[k], (int, float))]
-        if hasattr(strategy, 'htf_mult') and 'htf_ema_len' in params:
-            periods.append(int(params['htf_ema_len']) * int(getattr(strategy, 'htf_mult', 1)))
-        if periods:
-            max_period = max(periods)
-            return max(default_min, int(max_period) * 2)
-        return default_min
         
     async def _load_strategies(self):
         """Load active strategies from database for the configured mode."""
@@ -105,14 +80,14 @@ class StrategyEngine:
                 for symbol in strategy.symbols:
                     for timeframe in strategy.timeframes:
                         warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
-                        min_bars = self._get_min_bars_for_strategy(strategy, init_periods)
-                        self._min_bars_required[warmup_key] = min_bars
-                        self._warmup_complete[warmup_key] = False
+                        required = int(init_periods) if init_periods else 0
+                        self._warmup_required[warmup_key] = required
+                        self._warmup_complete[warmup_key] = (required == 0)
                         logger.info("Strategy warmup initialized",
                                   strategy=strategy.name,
                                   symbol=symbol,
                                   timeframe=timeframe,
-                                  min_bars=min_bars)
+                                  min_bars=required)
                 
     def _create_strategy(self, row: asyncpg.Record) -> Optional[BaseStrategy]:
         """Instantiate a strategy from DB row."""
@@ -183,23 +158,24 @@ class StrategyEngine:
             for symbol in strategy.symbols:
                 for timeframe in strategy.timeframes:
                     warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
-                    min_bars = self._min_bars_required.get(warmup_key, 200)
-                    history = await self._fetch_history(symbol, timeframe, bars=max(200, min_bars))
-                    if len(history) >= min_bars:
-                        self._warmup_complete[warmup_key] = True
-                        logger.info("Strategy warmup complete",
-                                    strategy=strategy.name,
-                                    symbol=symbol,
-                                    timeframe=timeframe,
-                                    history_bars=len(history))
-                    else:
-                        self._warmup_complete[warmup_key] = False
-                        logger.info("Strategy warmup pending",
-                                    strategy=strategy.name,
-                                    symbol=symbol,
-                                    timeframe=timeframe,
-                                    history_bars=len(history),
-                                    required_bars=min_bars)
+                    required = self._warmup_required.get(warmup_key, 0)
+                    if required > 0:
+                        history = await self._fetch_history(symbol, timeframe, bars=required)
+                        if len(history) >= required:
+                            self._warmup_complete[warmup_key] = True
+                            logger.info("Strategy warmup complete",
+                                        strategy=strategy.name,
+                                        symbol=symbol,
+                                        timeframe=timeframe,
+                                        history_bars=len(history))
+                        else:
+                            self._warmup_complete[warmup_key] = False
+                            logger.info("Strategy warmup pending",
+                                        strategy=strategy.name,
+                                        symbol=symbol,
+                                        timeframe=timeframe,
+                                        history_bars=len(history),
+                                        required_bars=required)
 
     def _in_strategy_session(self, strategy: BaseStrategy, candle_ts: Optional[datetime]) -> bool:
         """Check per-strategy session window if available."""
@@ -262,15 +238,15 @@ class StrategyEngine:
 
             # Fetch recent history for this symbol/timeframe
             warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
-            min_bars = self._min_bars_required.get(warmup_key, 200)
-            history = await self._fetch_history(symbol, timeframe, bars=max(200, min_bars))
+            required = self._warmup_required.get(warmup_key, 0)
+            history = await self._fetch_history(symbol, timeframe, bars=max(200, required))
 
             # Warmup check (requirement #2)
-            if not self._warmup_complete.get(warmup_key, True):
-                if len(history) < min_bars:
+            if required > 0 and not self._warmup_complete.get(warmup_key, True):
+                if len(history) < required:
                     logger.debug("Skipping signal - warmup in progress",
                                strategy=strategy.name, symbol=symbol, timeframe=timeframe,
-                               history_bars=len(history), required_bars=min_bars)
+                               history_bars=len(history), required_bars=required)
                     continue
                 else:
                     self._warmup_complete[warmup_key] = True

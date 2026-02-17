@@ -67,7 +67,7 @@ class StrategyEngine:
             rows = await conn.fetch("""
                 SELECT *
                 FROM strategies
-                WHERE is_live = true AND status = 'active' AND mode = $1
+                WHERE status = 'active' AND mode = $1
             """, self.mode)
             
         for row in rows:

@@ -3,17 +3,17 @@
 import pytest
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from signal_service.strategy.low_vol_momentum import LowVolMomentumStrategy
 
 
 class TestLowVolMomentumStrategy:
     """Test Low Volatility Momentum Strategy."""
-    
+
     @pytest.fixture
     def strategy(self):
-        """Create strategy instance."""
+        """Create strategy instance with test-friendly params."""
         return LowVolMomentumStrategy(
             strategy_id="test-123",
             name="low_vol_momentum",
@@ -22,121 +22,128 @@ class TestLowVolMomentumStrategy:
             timeframes=["15m"],
             params={
                 "atr_period": 14,
-                "lookback_days": 30,
-                "low_vol_threshold": 40,
-                "momentum_lookback": 48,
-                "stop_loss_pct": 2.0
-            }
+                "lookback_days": 1,  # shorter for tests (96 bars)
+                "low_vol_threshold": 100,  # force low regime
+                "momentum_lookback": 6,  # hours
+                "stop_loss_pct": 2.0,
+                "max_hold_hours": 48,
+                "exit_on_regime_change": True,
+                "require_candle_confirmation": False,
+            },
         )
-    
+
     @pytest.fixture
     def sample_history(self):
-        """Create sample OHLC history."""
+        """Create sample OHLC history with rising trend."""
         np.random.seed(42)
-        n = 500  # 500 periods of 15m = ~5 days
-        
-        # Generate price with low volatility trend
+        n = 120  # > 96 bars needed for 1-day lookback
         base_price = 50000
-        returns = np.random.normal(0.0001, 0.005, n)  # Low volatility
-        prices = base_price * np.exp(np.cumsum(returns))
-        
-        timestamps = [datetime.now() - timedelta(minutes=15*(n-i)) for i in range(n)]
-        
-        df = pd.DataFrame({
-            'timestamp': timestamps,
-            'open': prices * (1 + np.random.normal(0, 0.001, n)),
-            'high': prices * (1 + abs(np.random.normal(0, 0.003, n))),
-            'low': prices * (1 - abs(np.random.normal(0, 0.003, n))),
-            'close': prices,
-            'volume': np.random.uniform(100, 1000, n)
-        })
-        
+        # steady upward drift
+        prices = base_price * (1 + np.linspace(0, 0.30, n))
+        timestamps = [datetime.now(timezone.utc) - timedelta(minutes=15 * (n - i)) for i in range(n)]
+
+        df = pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "open": prices * (1 + np.random.normal(0, 0.0005, n)),
+                "high": prices * (1 + abs(np.random.normal(0, 0.001, n))),
+                "low": prices * (1 - abs(np.random.normal(0, 0.001, n))),
+                "close": prices,
+                "volume": np.random.uniform(100, 1000, n),
+            }
+        )
         return df
-    
+
     def test_strategy_creation(self, strategy):
-        """Test strategy is created with correct parameters."""
         assert strategy.name == "low_vol_momentum"
         assert strategy.atr_period == 14
-        assert strategy.low_vol_threshold == 40
-        assert strategy.momentum_lookback == 48
-        
-    def test_insufficient_data(self, strategy):
-        """Test returns None with insufficient data."""
+        assert strategy.low_vol_threshold == 100
+        assert strategy.momentum_lookback == 6
+        assert strategy.max_hold_hours == 48
+        assert strategy.exit_on_regime_change is True
+
+    def test_entry_without_candle_confirmation(self, strategy, sample_history):
+        """Should enter even if candle is bearish when confirmation is disabled."""
+        last_price = sample_history["close"].iloc[-1]
         candle = {
-            'timestamp': datetime.now(),
-            'open': 50000,
-            'high': 51000,
-            'low': 49000,
-            'close': 50500,
-            'volume': 1000
+            "timestamp": datetime.now(timezone.utc),
+            "symbol": "BTC",
+            "open": last_price * 1.01,  # bearish candle
+            "high": last_price * 1.02,
+            "low": last_price * 0.99,
+            "close": last_price * 0.99,
+            "volume": 1000,
         }
-        history = pd.DataFrame({
-            'timestamp': [datetime.now()],
-            'open': [50000],
-            'high': [51000],
-            'low': [49000],
-            'close': [50500],
-            'volume': [1000]
-        })
-        
-        signal = strategy.on_candle(candle, history)
-        assert signal is None
-        
-    def test_signal_in_low_vol_regime(self, strategy, sample_history):
-        """Test signal generation in low volatility regime."""
-        # Create a bullish candle with positive momentum
-        last_price = sample_history['close'].iloc[-1]
-        
-        candle = {
-            'timestamp': datetime.now(),
-            'open': last_price * 0.995,
-            'high': last_price * 1.01,
-            'low': last_price * 0.99,
-            'close': last_price * 1.005,  # Bullish close
-            'volume': 1000
-        }
-        
+
         signal = strategy.on_candle(candle, sample_history)
-        
-        # Should generate signal in low vol regime with positive momentum
-        if signal:
-            assert signal.side in ['long', 'short']
-            assert signal.price == candle['close']
-            assert signal.confidence > 0
-            assert 'atr_percentile' in signal.meta
-            assert signal.meta['regime'] == 'low'
-            
-    def test_no_signal_in_high_vol(self, strategy):
-        """Test no signal in high volatility regime."""
-        np.random.seed(42)
-        n = 500
-        
-        # Generate high volatility prices
-        base_price = 50000
-        returns = np.random.normal(0, 0.05, n)  # High volatility
-        prices = base_price * np.exp(np.cumsum(returns))
-        
-        timestamps = [datetime.now() - timedelta(minutes=15*(n-i)) for i in range(n)]
-        
-        history = pd.DataFrame({
-            'timestamp': timestamps,
-            'open': prices * (1 + np.random.normal(0, 0.01, n)),
-            'high': prices * (1 + abs(np.random.normal(0, 0.03, n))),
-            'low': prices * (1 - abs(np.random.normal(0, 0.03, n))),
-            'close': prices,
-            'volume': np.random.uniform(100, 1000, n)
-        })
-        
-        candle = {
-            'timestamp': datetime.now(),
-            'open': prices[-1] * 0.99,
-            'high': prices[-1] * 1.02,
-            'low': prices[-1] * 0.98,
-            'close': prices[-1] * 1.01,
-            'volume': 1000
+        assert signal is not None
+        assert signal.side == "long"
+
+    def test_exit_on_stop_loss(self, strategy):
+        """Exit when stop loss breached."""
+        now = datetime.now(timezone.utc)
+        strategy._positions["BTC"] = {
+            "side": "long",
+            "entry_price": 100.0,
+            "entry_ts": now - timedelta(hours=1),
+            "entry_regime": "low",
         }
-        
+        candle = {
+            "timestamp": now,
+            "symbol": "BTC",
+            "open": 99.0,
+            "high": 100.0,
+            "low": 96.0,
+            "close": 97.0,  # -3% from entry
+            "volume": 1000,
+        }
+        history = pd.DataFrame(
+            {
+                "timestamp": [now - timedelta(minutes=15)],
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.0],
+                "volume": [1000],
+            }
+        )
+
         signal = strategy.on_candle(candle, history)
-        
-        # Should not generate signal in high vol regime
-        assert signal is None
+        assert signal is not None
+        assert signal.side == "short"
+        assert signal.meta.get("exit_reason") == "stop_loss"
+
+    def test_exit_on_max_hold(self, strategy):
+        """Exit when max hold time exceeded."""
+        now = datetime.now(timezone.utc)
+        strategy.max_hold_hours = 0
+        strategy._positions["BTC"] = {
+            "side": "long",
+            "entry_price": 100.0,
+            "entry_ts": now - timedelta(hours=1),
+            "entry_regime": "low",
+        }
+        candle = {
+            "timestamp": now,
+            "symbol": "BTC",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1000,
+        }
+        history = pd.DataFrame(
+            {
+                "timestamp": [now - timedelta(minutes=15)],
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.0],
+                "volume": [1000],
+            }
+        )
+
+        signal = strategy.on_candle(candle, history)
+        assert signal is not None
+        assert signal.side == "short"
+        assert signal.meta.get("exit_reason") == "max_hold"

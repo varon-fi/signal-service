@@ -33,10 +33,19 @@ class SignalServiceImpl(SignalServiceServicer):
         queue: asyncio.Queue = asyncio.Queue()
         sub = (queue, request)
         self.server._subscribers.append(sub)
+        logger.info("New signal subscriber", strategies=request.strategy_ids, symbols=request.symbols)
 
         try:
-            while context.is_active():
-                signal: TradeSignal = await queue.get()
+            while True:
+                try:
+                    signal: TradeSignal = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Check if context is still valid (client disconnected if cancelled)
+                    if hasattr(context, 'cancelled') and context.cancelled():
+                        break
+                    if hasattr(context, 'is_active') and not context.is_active():
+                        break
+                    continue
 
                 # Filter by strategy/symbol if provided
                 if request.strategy_ids and signal.strategy_id not in request.strategy_ids:
@@ -45,9 +54,12 @@ class SignalServiceImpl(SignalServiceServicer):
                     continue
 
                 yield signal
+        except asyncio.CancelledError:
+            logger.info("Signal stream cancelled by client")
         finally:
             if sub in self.server._subscribers:
                 self.server._subscribers.remove(sub)
+            logger.info("Signal subscriber disconnected")
 
 
 class SignalServiceServer:

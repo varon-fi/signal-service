@@ -155,12 +155,15 @@ class StrategyEngine:
 
         # Prime warmup state by fetching historical bars
         for strategy_id, strategy in self.strategies.items():
+            history_source = (strategy.params or {}).get("history_source", "ohlcs")
             for symbol in strategy.symbols:
                 for timeframe in strategy.timeframes:
                     warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
                     required = self._warmup_required.get(warmup_key, 0)
                     if required > 0:
-                        history = await self._fetch_history(symbol, timeframe, bars=required)
+                        history = await self._fetch_history(
+                            symbol, timeframe, bars=required, source=history_source
+                        )
                         if len(history) >= required:
                             self._warmup_complete[warmup_key] = True
                             logger.info("Strategy warmup complete",

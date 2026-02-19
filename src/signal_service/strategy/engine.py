@@ -242,7 +242,8 @@ class StrategyEngine:
             # Fetch recent history for this symbol/timeframe
             warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
             required = self._warmup_required.get(warmup_key, 0)
-            history = await self._fetch_history(symbol, timeframe, bars=max(200, required))
+            history_source = (strategy.params or {}).get("history_source", "ohlcs")
+            history = await self._fetch_history(symbol, timeframe, bars=max(200, required), source=history_source)
 
             # Warmup check (requirement #2)
             if required > 0 and not self._warmup_complete.get(warmup_key, True):
@@ -355,18 +356,43 @@ class StrategyEngine:
             trace=trace,
         )
         
-    async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200) -> pd.DataFrame:
-        """Fetch recent OHLC history from database for symbol and timeframe."""
+    async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200, source: str = "ohlcs") -> pd.DataFrame:
+        """Fetch recent OHLC history from database for symbol and timeframe.
+
+        Args:
+            source: "ohlcs" (default) or "imported" (ohlc_imports table)
+        """
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT ts as timestamp, open, high, low, close, volume
-                FROM ohlcs o
-                JOIN instruments i ON o.instrument_id = i.id
-                WHERE i.symbol = $1 AND o.timeframe = $2
-                ORDER BY ts DESC
-                LIMIT $3
-            """, symbol, timeframe, bars)
-            
+            if source == "imported":
+                rows = await conn.fetch("""
+                    SELECT ts as timestamp, open, high, low, close, volume
+                    FROM ohlc_imports o
+                    JOIN instruments i ON o.instrument_id = i.id
+                    WHERE i.symbol = $1 AND o.timeframe = $2
+                    ORDER BY ts DESC
+                    LIMIT $3
+                """, symbol, timeframe, bars)
+
+                # Fallback to regular ohlcs view if imported data is missing
+                if not rows:
+                    rows = await conn.fetch("""
+                        SELECT ts as timestamp, open, high, low, close, volume
+                        FROM ohlcs o
+                        JOIN instruments i ON o.instrument_id = i.id
+                        WHERE i.symbol = $1 AND o.timeframe = $2
+                        ORDER BY ts DESC
+                        LIMIT $3
+                    """, symbol, timeframe, bars)
+            else:
+                rows = await conn.fetch("""
+                    SELECT ts as timestamp, open, high, low, close, volume
+                    FROM ohlcs o
+                    JOIN instruments i ON o.instrument_id = i.id
+                    WHERE i.symbol = $1 AND o.timeframe = $2
+                    ORDER BY ts DESC
+                    LIMIT $3
+                """, symbol, timeframe, bars)
+
         df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df = df.sort_values('timestamp').reset_index(drop=True)
         return df

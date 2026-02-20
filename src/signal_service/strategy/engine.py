@@ -156,13 +156,16 @@ class StrategyEngine:
         # Prime warmup state by fetching historical bars
         for strategy_id, strategy in self.strategies.items():
             history_source = (strategy.params or {}).get("history_source", "ohlcs")
+            lookback_days = (strategy.params or {}).get("lookback_days")
             for symbol in strategy.symbols:
                 for timeframe in strategy.timeframes:
                     warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
                     required = self._warmup_required.get(warmup_key, 0)
-                    if required > 0:
+                    lookback_bars = self._calc_lookback_bars(timeframe, lookback_days)
+                    bars_needed = max(required, lookback_bars) if lookback_bars else required
+                    if bars_needed > 0:
                         history = await self._fetch_history(
-                            symbol, timeframe, bars=required, source=history_source
+                            symbol, timeframe, bars=bars_needed, source=history_source
                         )
                         if len(history) >= required:
                             self._warmup_complete[warmup_key] = True
@@ -179,6 +182,33 @@ class StrategyEngine:
                                         timeframe=timeframe,
                                         history_bars=len(history),
                                         required_bars=required)
+
+    def _calc_lookback_bars(self, timeframe: str, lookback_days: Optional[int]) -> int:
+        """Convert lookback_days into number of bars for a timeframe."""
+        if not lookback_days or not timeframe:
+            return 0
+        tf = str(timeframe).strip().lower()
+        try:
+            if tf.endswith("m"):
+                minutes = int(tf[:-1])
+                if minutes <= 0:
+                    return 0
+                bars_per_day = int((24 * 60) / minutes)
+                return int(lookback_days) * bars_per_day
+            if tf.endswith("h"):
+                hours = int(tf[:-1])
+                if hours <= 0:
+                    return 0
+                bars_per_day = int(24 / hours)
+                return int(lookback_days) * bars_per_day
+            if tf.endswith("d"):
+                days = int(tf[:-1]) if tf[:-1] else 1
+                if days <= 0:
+                    return 0
+                return int(lookback_days / days)
+        except Exception:
+            return 0
+        return 0
 
     def _in_strategy_session(self, strategy: BaseStrategy, candle_ts: Optional[datetime]) -> bool:
         """Check per-strategy session window if available."""
@@ -243,7 +273,10 @@ class StrategyEngine:
             warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
             required = self._warmup_required.get(warmup_key, 0)
             history_source = (strategy.params or {}).get("history_source", "ohlcs")
-            history = await self._fetch_history(symbol, timeframe, bars=max(200, required), source=history_source)
+            lookback_days = (strategy.params or {}).get("lookback_days")
+            lookback_bars = self._calc_lookback_bars(timeframe, lookback_days)
+            bars_needed = max(200, required, lookback_bars) if lookback_bars else max(200, required)
+            history = await self._fetch_history(symbol, timeframe, bars=bars_needed, source=history_source)
 
             # Warmup check (requirement #2)
             if required > 0 and not self._warmup_complete.get(warmup_key, True):

@@ -60,6 +60,20 @@ class StrategyEngine:
         await self._load_strategies()
         await self._initialize_startup_state()
         logger.info("Strategies reloaded", strategy_count=len(self.strategies))
+
+    def get_required_subscriptions(self) -> dict[str, list[str]]:
+        """Get all symbol/timeframe combinations required by active strategies.
+
+        Returns:
+            Dict mapping timeframe -> list of symbols
+        """
+        subscriptions: dict[str, set[str]] = {}
+        for strategy in self.strategies.values():
+            for timeframe in strategy.timeframes:
+                if timeframe not in subscriptions:
+                    subscriptions[timeframe] = set()
+                subscriptions[timeframe].update(strategy.symbols)
+        return {tf: list(symbols) for tf, symbols in subscriptions.items()}
         
     async def _load_strategies(self):
         """Load active strategies from database for the configured mode."""

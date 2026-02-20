@@ -238,6 +238,10 @@ class LowVolMomentumStrategy(BaseStrategy):
             return None
 
         regime, atr_percentile = self._get_vol_regime(history)
+        
+        # DEBUG: Log every evaluation (temporarily verbose for debugging)
+        logger.info(f"DEBUG: {key} regime={regime} atr_pct={atr_percentile:.2f} hist_len={len(history)} threshold={self.low_vol_threshold}")
+        
         if regime != "low":
             return None
 

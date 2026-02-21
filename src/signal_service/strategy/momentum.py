@@ -5,10 +5,10 @@ from typing import Optional
 
 import pandas as pd
 import pytz
-import talib
 from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register
+from varon_fi.ta import rsi
 
 logger = get_logger(__name__)
 
@@ -94,7 +94,7 @@ class MomentumStrategy(BaseStrategy):
         closes = history['close'].values
         
         # RSI
-        rsi = talib.RSI(closes, timeperiod=rsi_length)
+        rsi_vals = rsi(closes, rsi_length)
         
         # VWAP calculation
         vwap_series = self._calculate_vwap(history)
@@ -104,13 +104,13 @@ class MomentumStrategy(BaseStrategy):
         vwap_upper = vwap * (1 + vwap_deviation / 100)
         vwap_lower = vwap * (1 - vwap_deviation / 100)
         
-        if pd.isna(rsi[-1]) or pd.isna(vwap):
+        if pd.isna(rsi_vals[-1]) or pd.isna(vwap):
             return None
             
         # Current values
         curr_close = candle['close']
         curr_open = candle['open']
-        curr_rsi = rsi[-1]
+        curr_rsi = rsi_vals[-1]
         
         # Entry conditions
         # Long: Price above VWAP lower, RSI between oversold and 50, bullish candle

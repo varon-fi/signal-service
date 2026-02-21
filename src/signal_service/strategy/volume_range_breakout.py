@@ -5,10 +5,10 @@ from typing import Optional
 
 import pandas as pd
 import pytz
-import talib
 from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register
+from varon_fi.ta import atr
 
 logger = get_logger(__name__)
 
@@ -91,15 +91,15 @@ class VolumeRangeBreakoutStrategy(BaseStrategy):
         volumes = history['volume'].values
         
         # Range detection
-        range_high = talib.MAX(highs, timeperiod=lookback)
-        range_low = talib.MIN(lows, timeperiod=lookback)
+        range_high = pd.Series(highs).rolling(lookback).max().values
+        range_low = pd.Series(lows).rolling(lookback).min().values
         
         # Volume analysis
-        avg_volume = talib.SMA(volumes, timeperiod=lookback)
+        avg_volume = pd.Series(volumes).rolling(lookback).mean().values
         
         # Volatility filter (ATR-based)
-        atr = talib.ATR(highs, lows, closes, timeperiod=14)
-        volatility = (atr / closes) * 100
+        atr_vals = atr(highs, lows, closes, 14)
+        volatility = (atr_vals / closes) * 100
         
         if pd.isna(range_high[-1]) or pd.isna(avg_volume[-1]) or pd.isna(volatility[-1]):
             return None

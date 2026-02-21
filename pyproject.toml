@@ -19,7 +19,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "structlog>=23.0.0",
     "pytz>=2024.1",
-    "varon-fi @ git+https://github.com/varon-fi/python.git@19db92db7e7d0646bacd0c234d823b3374d95a50",
+    "varon-fi @ git+https://github.com/varon-fi/python.git@b17eda308b5f28d7b74a9d7db3bdb4f3d5afb265",
 ]
 
 [project.optional-dependencies]

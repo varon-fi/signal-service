@@ -24,13 +24,11 @@ class StrategyEngine:
         self,
         database_url: str,
         execution_client: Optional[ExecutionServiceClient] = None,
-        mode: str = "live",
     ):
         self.database_url = database_url
         self.pool: Optional[asyncpg.Pool] = None
         self.strategies: dict[str, BaseStrategy] = {}
         self.execution_client = execution_client
-        self.mode = mode.lower()
         # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals
         self._last_candle_ts: dict[str, datetime] = {}
         # Track warmup requirements per strategy/symbol/timeframe
@@ -76,13 +74,13 @@ class StrategyEngine:
         return {tf: list(symbols) for tf, symbols in subscriptions.items()}
         
     async def _load_strategies(self):
-        """Load active strategies from database for the configured mode."""
+        """Load all active strategies from database."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT *
                 FROM strategies
-                WHERE status = 'active' AND mode = $1
-            """, self.mode)
+                WHERE status = 'active'
+            """)
             
         for row in rows:
             strategy = self._create_strategy(row)
@@ -124,7 +122,7 @@ class StrategyEngine:
 
         config = StrategyConfig(name=name, params=params)
         try:
-            return create_strategy(
+            strategy = create_strategy(
                 config,
                 strategy_id=str(row["id"]),
                 name=name,
@@ -132,6 +130,10 @@ class StrategyEngine:
                 symbols=row["symbols"],
                 timeframes=row["timeframes"],
             )
+            mode_val = row.get("mode") if isinstance(row, dict) else row.get("mode")
+            if mode_val:
+                setattr(strategy, "mode", str(mode_val))
+            return strategy
         except KeyError:
             logger.warning(
                 "Unknown strategy type",
@@ -311,6 +313,11 @@ class StrategyEngine:
                 signal.strategy_version = strategy.version
                 signal.symbol = symbol
                 signal.timeframe = timeframe
+
+                if signal.meta is None:
+                    signal.meta = {}
+                if getattr(strategy, "mode", None):
+                    signal.meta["mode"] = getattr(strategy, "mode")
                 
                 # Persist to database
                 await self._persist_signal(signal)
@@ -376,7 +383,7 @@ class StrategyEngine:
         timestamp.FromDatetime(now)
 
         # Convert mode string to TradingMode enum
-        mode_str = (signal.meta.get("mode") if signal.meta else None) or self.mode
+        mode_str = (signal.meta.get("mode") if signal.meta else None) or "paper"
         mode_str = str(mode_str).lower()
         mode = TradingMode.LIVE if mode_str == "live" else TradingMode.PAPER
 
@@ -460,6 +467,7 @@ class StrategyEngine:
             signal_type = signal.side.upper() if signal.side else "UNKNOWN"
             signal_value = float(signal.price) if signal.price else 0.0
             
+            mode_val = (signal.meta.get("mode") if signal.meta else None) or "paper"
             await conn.execute("""
                 INSERT INTO signals 
                 (exchange_id, instrument_id, strategy_id, strategy_version,
@@ -469,7 +477,7 @@ class StrategyEngine:
             """,
             instrument_id, signal.strategy_id, signal.strategy_version,
             signal_type, signal_value, signal.confidence,
-            json.dumps(signal.meta), self.mode, 
+            json.dumps(signal.meta), mode_val, 
             signal.idempotency_key, signal.correlation_id)
             
     async def shutdown(self):

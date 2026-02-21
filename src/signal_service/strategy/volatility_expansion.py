@@ -5,10 +5,10 @@ from typing import Optional
 
 import pandas as pd
 import pytz
-import talib
 from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register
+from varon_fi.ta import ema, atr, bollinger_bands
 
 logger = get_logger(__name__)
 
@@ -92,16 +92,13 @@ class VolatilityExpansionStrategy(BaseStrategy):
         lows = history['low'].values
         
         # Keltner Channels
-        keltner_basis = talib.EMA(closes, timeperiod=keltner_len)
-        atr = talib.ATR(highs, lows, closes, timeperiod=keltner_len)
-        keltner_upper = keltner_basis + atr_mult * atr
-        keltner_lower = keltner_basis - atr_mult * atr
+        keltner_basis = ema(closes, keltner_len)
+        atr_vals = atr(highs, lows, closes, keltner_len)
+        keltner_upper = keltner_basis + atr_mult * atr_vals
+        keltner_lower = keltner_basis - atr_mult * atr_vals
         
         # Bollinger Bands
-        bb_basis = talib.SMA(closes, timeperiod=bb_len)
-        bb_stdev = talib.STDDEV(closes, timeperiod=bb_len)
-        bb_upper = bb_basis + bb_mult * bb_stdev
-        bb_lower = bb_basis - bb_mult * bb_stdev
+        bb_upper, bb_basis, bb_lower = bollinger_bands(closes, bb_len, bb_mult)
         
         if pd.isna(keltner_upper[-1]) or pd.isna(bb_upper[-1]):
             return None

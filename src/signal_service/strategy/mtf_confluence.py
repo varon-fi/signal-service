@@ -5,10 +5,10 @@ from typing import Optional
 
 import pandas as pd
 import pytz
-import talib
 from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register
+from varon_fi.ta import ema, rsi
 
 logger = get_logger(__name__)
 
@@ -18,13 +18,13 @@ class MtfConfluenceStrategy(BaseStrategy):
     name = "mtf_confluence"
     """
     Multi-Timeframe Confluence Strategy - Live Version
-    
+
     Uses 15m HTF for trend direction (EMA + RSI) and 5m LTF for entry precision.
     Enters on pullbacks in the direction of the higher timeframe trend.
-    
+
     Session: 14:00-18:00 UTC (matches Pine Script)
     """
-    
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.htf_mult = 3  # 15m = 3x 5m candles
@@ -32,7 +32,7 @@ class MtfConfluenceStrategy(BaseStrategy):
         # Session filter: 14:00-18:00 UTC (matches Pine Script)
         self.session_start = time(14, 0)  # 14:00 UTC
         self.session_end = time(18, 0)    # 18:00 UTC
-        
+
     def _in_session(self, ts) -> bool:
         """Check if timestamp is within trading session (14:00-18:00 UTC)."""
         # Handle different timestamp types
@@ -46,11 +46,11 @@ class MtfConfluenceStrategy(BaseStrategy):
             ts = pd.to_datetime(ts)
         elif hasattr(ts, 'ToDatetime'):  # Protobuf Timestamp with ToDatetime method
             ts = ts.ToDatetime(tzinfo=self.utc)
-        
+
         # Ensure datetime
         if not isinstance(ts, datetime):
             return True  # Allow if we can't parse
-        
+
         # Ensure timestamp is UTC
         try:
             if ts.tzinfo is None:
@@ -59,95 +59,95 @@ class MtfConfluenceStrategy(BaseStrategy):
                 ts = ts.astimezone(self.utc)
         except (AttributeError, ValueError):
             pass
-        
+
         current_time = ts.time()
         return self.session_start <= current_time <= self.session_end
-        
+
     def on_candle(self, candle: dict, history: pd.DataFrame) -> Optional[Signal]:
         """Process new candle and return signal if conditions met."""
         if len(history) < 200:
             return None
-            
+
         # Convert Decimal columns to float for TA-Lib compatibility
         history = history.copy()
         for col in ['open', 'high', 'low', 'close', 'volume']:
             if col in history.columns:
                 history[col] = history[col].astype(float)
-        
+
         # Convert numeric candle values to float
         numeric_fields = {'open', 'high', 'low', 'close', 'volume', 'price'}
-        candle = {k: float(v) if k in numeric_fields and v is not None else v 
+        candle = {k: float(v) if k in numeric_fields and v is not None else v
                   for k, v in candle.items()}
-        
+
         # Session filter (14:00-18:00 UTC) - matches Pine Script
         candle_ts = candle.get('timestamp') or candle.get('ts')
         if candle_ts is not None:
             if not self._in_session(candle_ts):
                 return None  # Outside trading session
-            
+
         # Parameters
         htf_ema_len = int(self.params.get("htf_ema_len", 50))
         htf_rsi_len = int(self.params.get("htf_rsi_len", 14))
         htf_rsi_mid = int(self.params.get("htf_rsi_mid", 50))
         ltf_ema_len = int(self.params.get("ltf_ema_len", 20))
         pullback_pct = float(self.params.get("pullback_pct", 0.3))
-        
+
         # Build HTF OHLC (15m from 5m data)
         htf_closes = self._resample_htf(history['close'])
         htf_highs = self._resample_htf(history['high'], agg='max')
         htf_lows = self._resample_htf(history['low'], agg='min')
-        
+
         if len(htf_closes) < htf_ema_len + 2:
             return None
-            
+
         # HTF indicators
-        htf_ema = talib.EMA(htf_closes, timeperiod=htf_ema_len)
-        htf_rsi = talib.RSI(htf_closes, timeperiod=htf_rsi_len)
-        
+        htf_ema = ema(htf_closes, htf_ema_len)
+        htf_rsi = rsi(htf_closes, htf_rsi_len)
+
         # LTF indicators
-        ltf_ema = talib.EMA(history['close'], timeperiod=ltf_ema_len)
-        
+        ltf_ema = ema(history['close'], ltf_ema_len)
+
         # Get current values
         curr_close = candle['close']
         curr_open = candle['open']
         curr_ltf_ema = ltf_ema.iloc[-1]
-        
+
         # Get last COMPLETED HTF values (index -2 to avoid partial bar)
         htf_close = htf_closes.iloc[-2]
         htf_ema_val = htf_ema.iloc[-2]
         htf_rsi_val = htf_rsi.iloc[-2]
-        
+
         if pd.isna(htf_ema_val) or pd.isna(htf_rsi_val) or pd.isna(curr_ltf_ema):
             return None
-            
+
         # Trend determination
         htf_bullish = (htf_close > htf_ema_val) and (htf_rsi_val > htf_rsi_mid)
         htf_bearish = (htf_close < htf_ema_val) and (htf_rsi_val < htf_rsi_mid)
-        
+
         if not (htf_bullish or htf_bearish):
             return None
-            
+
         # Pullback calculation
         recent_high_ltf = history['high'].iloc[-5:].max()
         recent_low_ltf = history['low'].iloc[-5:].min()
-        
+
         EMA_PROXIMITY_BUFFER = 0.001  # 0.1% buffer
         pullback_threshold = pullback_pct / 100.0
-        
+
         # Long pullback conditions
         price_near_ema_long = curr_close < curr_ltf_ema * (1 + EMA_PROXIMITY_BUFFER)
         breakout_above_high = curr_close > recent_high_ltf * (1 - pullback_threshold)
         pullback_long = (price_near_ema_long or breakout_above_high) and (curr_close > curr_open)
-        
-        # Short pullback conditions  
+
+        # Short pullback conditions
         price_near_ema_short = curr_close > curr_ltf_ema * (1 - EMA_PROXIMITY_BUFFER)
         breakdown_below_low = curr_close < recent_low_ltf * (1 + pullback_threshold)
         pullback_short = (price_near_ema_short or breakdown_below_low) and (curr_close < curr_open)
-        
+
         # Entry conditions
         long_cond = htf_bullish and pullback_long and (curr_close > curr_ltf_ema)
         short_cond = htf_bearish and pullback_short and (curr_close < curr_ltf_ema)
-        
+
         if long_cond:
             return Signal(
                 side="long",
@@ -162,7 +162,7 @@ class MtfConfluenceStrategy(BaseStrategy):
                     "session": "14:00-18:00 UTC",
                 }
             )
-            
+
         if short_cond:
             return Signal(
                 side="short",
@@ -177,9 +177,9 @@ class MtfConfluenceStrategy(BaseStrategy):
                     "session": "14:00-18:00 UTC",
                 }
             )
-            
+
         return None
-        
+
     def _resample_htf(self, series: pd.Series, agg: str = 'last') -> pd.Series:
         """Resample 5m series to 15m HTF."""
         groups = series.index // self.htf_mult

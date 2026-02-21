@@ -53,11 +53,11 @@ async def test_load_strategies_from_db():
         }
     ]
     conn = FakeConn(rows)
-    engine = StrategyEngine("postgresql://localhost/varon_fi", mode="live")
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
     engine.pool = FakePool(conn)
 
     await engine._load_strategies()
 
     assert "11111111-1111-1111-1111-111111111111" in engine.strategies
-    assert conn.last_args == ("live",)
-    assert "mode = $1" in conn.last_query
+    assert conn.last_args == ()
+    assert "status = 'active'" in conn.last_query

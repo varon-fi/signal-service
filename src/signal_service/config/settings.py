@@ -10,6 +10,7 @@ class Settings:
     database_url: str
     dataservice_addr: str
     signalservice_port: int
+    executionservice_addr: str = "localhost:50053"
     trading_mode: str = "live"
     
     # OHLC subscription defaults

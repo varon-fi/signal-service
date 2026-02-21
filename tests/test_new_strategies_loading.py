@@ -54,7 +54,7 @@ async def test_load_volatility_expansion():
         }
     ]
     conn = FakeConn(rows)
-    engine = StrategyEngine("postgresql://localhost/varon_fi", mode="paper")
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
     engine.pool = FakePool(conn)
 
     await engine._load_strategies()
@@ -83,7 +83,7 @@ async def test_load_volume_range_breakout():
         }
     ]
     conn = FakeConn(rows)
-    engine = StrategyEngine("postgresql://localhost/varon_fi", mode="paper")
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
     engine.pool = FakePool(conn)
 
     await engine._load_strategies()
@@ -112,7 +112,7 @@ async def test_load_momentum():
         }
     ]
     conn = FakeConn(rows)
-    engine = StrategyEngine("postgresql://localhost/varon_fi", mode="paper")
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
     engine.pool = FakePool(conn)
 
     await engine._load_strategies()
@@ -141,7 +141,7 @@ async def test_load_atr_breakout():
         }
     ]
     conn = FakeConn(rows)
-    engine = StrategyEngine("postgresql://localhost/varon_fi", mode="paper")
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
     engine.pool = FakePool(conn)
 
     await engine._load_strategies()
@@ -206,7 +206,7 @@ async def test_load_all_new_strategies():
         },
     ]
     conn = FakeConn(rows)
-    engine = StrategyEngine("postgresql://localhost/varon_fi", mode="paper")
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
     engine.pool = FakePool(conn)
 
     await engine._load_strategies()

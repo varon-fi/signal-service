@@ -9,3 +9,6 @@ from signal_service.strategy import volume_range_breakout  # noqa: F401
 from signal_service.strategy import momentum  # noqa: F401
 from signal_service.strategy import atr_breakout  # noqa: F401
 from signal_service.strategy import low_vol_momentum  # noqa: F401
+from signal_service.strategy import liquidity_sweep_reversal  # noqa: F401
+from signal_service.strategy import range_mean_reversion  # noqa: F401
+from signal_service.strategy import breakout_retest  # noqa: F401

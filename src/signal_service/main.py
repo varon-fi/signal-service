@@ -51,10 +51,13 @@ async def main():
     engine = StrategyEngine(settings.database_url)
     await engine.initialize()
 
-    # Get required subscriptions from strategies
+    # Get required subscriptions from strategies (retry until at least one is active)
     subscriptions = engine.get_required_subscriptions()
-    if not subscriptions:
-        raise RuntimeError("No active strategies found - nothing to subscribe to")
+    while not subscriptions:
+        print("⚠️  No active strategies found - retrying in 30s")
+        await asyncio.sleep(30)
+        await engine.reload_strategies()
+        subscriptions = engine.get_required_subscriptions()
 
     print(f"📊 Signal Service starting with subscriptions:")
     for timeframe, symbols in subscriptions.items():

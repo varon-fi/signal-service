@@ -173,7 +173,7 @@ class StrategyEngine:
 
         # Prime warmup state by fetching historical bars
         for strategy_id, strategy in self.strategies.items():
-            history_source = (strategy.params or {}).get("history_source", "ohlcs")
+            history_source = (strategy.params or {}).get("history_source", "auto")
             lookback_days = (strategy.params or {}).get("lookback_days")
             for symbol in strategy.symbols:
                 for timeframe in strategy.timeframes:
@@ -349,7 +349,7 @@ class StrategyEngine:
             # Fetch recent history for this symbol/timeframe
             warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
             required = self._warmup_required.get(warmup_key, 0)
-            history_source = (strategy.params or {}).get("history_source", "ohlcs")
+            history_source = (strategy.params or {}).get("history_source", "auto")
             lookback_days = (strategy.params or {}).get("lookback_days")
             lookback_bars = self._calc_lookback_bars(timeframe, lookback_days)
             bars_needed = max(200, required, lookback_bars) if lookback_bars else max(200, required)
@@ -475,10 +475,43 @@ class StrategyEngine:
         """Fetch recent OHLC history from database for symbol and timeframe.
 
         Args:
-            source: "ohlcs" (default) or "imported" (ohlc_imports table)
+            source: "ohlcs" (default), "imported", or "auto" (prefer ohlcs, fallback to imports if insufficient)
         """
+        bars = int(bars or 0)
+        if bars <= 0:
+            bars = 1
+
+        source = (source or "ohlcs").lower()
+
         async with self.pool.acquire() as conn:
-            if source == "imported":
+            if source == "auto":
+                ohlcs_rows = await conn.fetch("""
+                    SELECT ts as timestamp, open, high, low, close, volume
+                    FROM ohlcs o
+                    JOIN instruments i ON o.instrument_id = i.id
+                    WHERE i.symbol = $1 AND o.timeframe = $2
+                    ORDER BY ts DESC
+                    LIMIT $3
+                """, symbol, timeframe, bars)
+
+                if len(ohlcs_rows) >= bars:
+                    rows = ohlcs_rows
+                else:
+                    imported_rows = await conn.fetch("""
+                        SELECT ts as timestamp, open, high, low, close, volume
+                        FROM ohlc_imports o
+                        JOIN instruments i ON o.instrument_id = i.id
+                        WHERE i.symbol = $1 AND o.timeframe = $2
+                        ORDER BY ts DESC
+                        LIMIT $3
+                    """, symbol, timeframe, bars)
+
+                    if len(imported_rows) >= bars or len(imported_rows) > len(ohlcs_rows):
+                        rows = imported_rows
+                    else:
+                        rows = ohlcs_rows
+
+            elif source == "imported":
                 rows = await conn.fetch("""
                     SELECT ts as timestamp, open, high, low, close, volume
                     FROM ohlc_imports o
@@ -511,7 +544,7 @@ class StrategyEngine:
         df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df = df.sort_values('timestamp').reset_index(drop=True)
         return df
-        
+
     async def _persist_signal(self, signal: Signal) -> Optional[str]:
         """Persist signal to database. Returns signal UUID (id)."""
         async with self.pool.acquire() as conn:

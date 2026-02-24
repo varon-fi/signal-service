@@ -443,8 +443,11 @@ class StrategyEngine:
         timestamp = Timestamp()
         timestamp.FromDatetime(now)
 
+        # Normalize meta to dict (handles string/JSON edge cases)
+        meta = self._normalize_meta(signal.meta)
+
         # Convert mode string to TradingMode enum
-        mode_str = (signal.meta.get("mode") if signal.meta else None) or "paper"
+        mode_str = meta.get("mode") or "paper"
         mode_str = str(mode_str).lower()
         mode = TradingMode.LIVE if mode_str == "live" else TradingMode.PAPER
 
@@ -467,9 +470,30 @@ class StrategyEngine:
             price=signal.price or 0.0,
             confidence=signal.confidence,
             mode=mode,
-            meta={str(k): "" if v is None else str(v) for k, v in signal.meta.items()} if signal.meta else {},
+            meta={str(k): "" if v is None else str(v) for k, v in meta.items()},
             trace=trace,
         )
+
+    def _normalize_meta(self, meta_value) -> dict:
+        """Normalize meta field to Python dict.
+
+        Handles multiple formats:
+        - Already a dict (normal case)
+        - JSON string (deserialization edge cases)
+        - None (returns empty dict)
+        """
+        if meta_value is None:
+            return {}
+        if isinstance(meta_value, dict):
+            return meta_value
+        if isinstance(meta_value, str):
+            try:
+                return json.loads(meta_value) if meta_value else {}
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse meta as JSON: {meta_value[:100]}...")
+                return {}
+        logger.warning(f"Unexpected meta type {type(meta_value)}, using empty dict")
+        return {}
         
     async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200, source: str = "ohlcs") -> pd.DataFrame:
         """Fetch recent OHLC history from database for symbol and timeframe.

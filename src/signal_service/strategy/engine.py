@@ -48,6 +48,7 @@ class StrategyEngine:
         self.pool = await asyncpg.create_pool(self.database_url)
         await self._load_strategies()
         await self._initialize_startup_state()
+        await self._initialize_positions_state()
         logger.info("StrategyEngine initialized", strategy_count=len(self.strategies))
 
     async def reload_strategies(self):
@@ -57,6 +58,7 @@ class StrategyEngine:
         self._warmup_complete.clear()
         await self._load_strategies()
         await self._initialize_startup_state()
+        await self._initialize_positions_state()
         logger.info("Strategies reloaded", strategy_count=len(self.strategies))
 
     def get_required_subscriptions(self) -> dict[str, list[str]]:
@@ -199,6 +201,65 @@ class StrategyEngine:
                                         history_bars=len(history),
                                         required_bars=required)
 
+    async def _initialize_positions_state(self):
+        """Hydrate in-memory strategy positions from DB (for exit logic)."""
+        if not self.strategies or not self.pool:
+            return
+
+        async with self.pool.acquire() as conn:
+            for strategy_id, strategy in self.strategies.items():
+                if getattr(strategy, "name", "") != "low_vol_momentum":
+                    continue
+                if not hasattr(strategy, "_positions"):
+                    continue
+                for symbol in strategy.symbols:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT quantity, avg_entry_price, entry_ts, entry_regime
+                        FROM positions
+                        WHERE strategy_id = $1 AND symbol = $2
+                        """,
+                        strategy_id, symbol
+                    )
+                    if not row or row["quantity"] is None or float(row["quantity"]) == 0:
+                        continue
+
+                    qty = float(row["quantity"])
+                    entry_price = float(row["avg_entry_price"]) if row["avg_entry_price"] else None
+                    entry_ts = row["entry_ts"]
+                    entry_regime = row["entry_regime"]
+
+                    # Fallback: derive entry_ts/entry_regime from latest filled order
+                    if entry_ts is None:
+                        order_row = await conn.fetchrow(
+                            """
+                            SELECT filled_at, meta->>'regime' AS regime
+                            FROM orders
+                            WHERE strategy_id = $1 AND symbol = $2 AND status = 'filled'
+                            ORDER BY filled_at DESC
+                            LIMIT 1
+                            """,
+                            strategy_id, symbol
+                        )
+                        if order_row:
+                            entry_ts = order_row["filled_at"]
+                            entry_regime = entry_regime or order_row["regime"]
+
+                    side = "long" if qty > 0 else "short"
+                    strategy._positions[symbol] = {
+                        "side": side,
+                        "entry_price": entry_price,
+                        "entry_ts": entry_ts,
+                        "entry_regime": entry_regime or "unknown",
+                    }
+                    logger.info("Hydrated position state",
+                                strategy=strategy.name,
+                                symbol=symbol,
+                                side=side,
+                                entry_price=entry_price,
+                                entry_ts=entry_ts,
+                                entry_regime=entry_regime)
+
     def _calc_lookback_bars(self, timeframe: str, lookback_days: Optional[int]) -> int:
         """Convert lookback_days into number of bars for a timeframe."""
         if not lookback_days or not timeframe:
@@ -320,18 +381,18 @@ class StrategyEngine:
                     signal.meta["mode"] = getattr(strategy, "mode")
                 
                 # Persist to database
-                await self._persist_signal(signal)
+                signal_db_id = await self._persist_signal(signal)
                 
                 # Send to ExecutionService if connected
                 if self.execution_client:
                     try:
-                        trade_signal = self._to_trade_signal(signal)
+                        trade_signal = self._to_trade_signal(signal, signal_db_id)
                         await self.execution_client.execute_signal(trade_signal)
                     except Exception as e:
                         # Log error but don't fail - signal is already persisted
                         logger.error(
                             "Failed to send signal to ExecutionService",
-                            signal_id=signal.idempotency_key,
+                            signal_id=signal_db_id or signal.idempotency_key,
                             correlation_id=signal.correlation_id,
                             error=str(e),
                         )
@@ -376,7 +437,7 @@ class StrategyEngine:
 
         return dt
         
-    def _to_trade_signal(self, signal: Signal) -> TradeSignal:
+    def _to_trade_signal(self, signal: Signal, signal_db_id: Optional[str] = None) -> TradeSignal:
         """Convert internal Signal to TradeSignal protobuf matching PR#7 proto."""
         now = datetime.now(timezone.utc)
         timestamp = Timestamp()
@@ -397,7 +458,7 @@ class StrategyEngine:
         )
 
         return TradeSignal(
-            signal_id=signal.idempotency_key if signal.idempotency_key else str(uuid.uuid4()),
+            signal_id=signal_db_id or signal.idempotency_key or str(uuid.uuid4()),
             strategy_id=signal.strategy_id or "",
             strategy_version=signal.strategy_version or "",
             symbol=signal.symbol or "",
@@ -451,8 +512,8 @@ class StrategyEngine:
         df = df.sort_values('timestamp').reset_index(drop=True)
         return df
         
-    async def _persist_signal(self, signal: Signal):
-        """Persist signal to database."""
+    async def _persist_signal(self, signal: Signal) -> Optional[str]:
+        """Persist signal to database. Returns signal UUID (id)."""
         async with self.pool.acquire() as conn:
             # Map symbol to instrument_id (Hyperliquid = exchange_id 1)
             instrument_id = await conn.fetchval("""
@@ -461,24 +522,26 @@ class StrategyEngine:
             
             if instrument_id is None:
                 logger.warning("Unknown instrument for signal", symbol=signal.symbol)
-                return
+                return None
             
             # Map side to signal_type/signal_value
             signal_type = signal.side.upper() if signal.side else "UNKNOWN"
             signal_value = float(signal.price) if signal.price else 0.0
             
             mode_val = (signal.meta.get("mode") if signal.meta else None) or "paper"
-            await conn.execute("""
+            row = await conn.fetchrow("""
                 INSERT INTO signals 
                 (exchange_id, instrument_id, strategy_id, strategy_version,
                  signal_type, signal_value, confidence, payload, mode, 
                  idempotency_key, correlation_id)
                 VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id
             """,
             instrument_id, signal.strategy_id, signal.strategy_version,
             signal_type, signal_value, signal.confidence,
             json.dumps(signal.meta), mode_val, 
             signal.idempotency_key, signal.correlation_id)
+            return str(row["id"]) if row else None
             
     async def shutdown(self):
         """Cleanup resources."""

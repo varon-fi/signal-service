@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
-import numpy as np
 from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register
@@ -95,9 +94,6 @@ class RangeMeanReversionStrategy(BaseStrategy):
 
     def on_candle(self, candle: dict, history: pd.DataFrame) -> Optional[Signal]:
         """Process new candle and return signal if conditions met."""
-        if len(history) < 50:
-            return None
-
         # Convert Decimal columns to float
         history = history.copy()
         for col in ["open", "high", "low", "close", "volume"]:
@@ -111,39 +107,18 @@ class RangeMeanReversionStrategy(BaseStrategy):
         if curr_close is None:
             return None
 
-        # Ensure minimum bars for calculations
-        min_bars = max(self.vwap_lookback, self.rsi_period, self.ema_filter_period) + 5
-        if len(history) < min_bars:
-            return None
-
         closes = history["close"].values
         highs = history["high"].values
         lows = history["low"].values
         volumes = history["volume"].values
 
-        # Calculate VWAP
-        curr_vwap = self._calculate_vwap(history)
+        # Calculate VWAP (needed for exits even with short history)
+        try:
+            curr_vwap = self._calculate_vwap(history)
+        except Exception:
+            curr_vwap = None
 
-        # RSI calculation
-        rsi_vals = rsi(closes, self.rsi_period)
-        curr_rsi = rsi_vals[-1]
-
-        # EMA trend filter
-        ema_vals = ema(closes, self.ema_filter_period)
-        if len(ema_vals) < 6 or pd.isna(ema_vals[-1]):
-            return None
-
-        ema_slope = (ema_vals[-1] - ema_vals[-5]) / ema_vals[-5] * 100 if ema_vals[-5] else 0
-        trend_flat = abs(ema_slope) < 0.5
-
-        # ATR volatility filter
-        atr_vals = atr(highs, lows, closes, 14)
-        curr_atr = atr_vals[-1]
-        atr_pct = (curr_atr / curr_close) * 100 if curr_close else 0
-        if atr_pct > self.max_atr_pct:
-            return None
-
-        # Deviation from VWAP
+        # Calculate deviation for exits (doesn't require full history)
         deviation = ((curr_close - curr_vwap) / curr_vwap) * 100 if curr_vwap else 0
 
         # Get position key and check for existing position
@@ -190,6 +165,8 @@ class RangeMeanReversionStrategy(BaseStrategy):
                             "position_age_candles": position_age_candles,
                             "position_age_minutes": position_age_minutes,
                             "entry_price": float(entry_price),
+                            "strategy_type": "range_mean_reversion",
+                            "version": "1.1.0",
                         },
                     )
             else:  # short
@@ -206,6 +183,8 @@ class RangeMeanReversionStrategy(BaseStrategy):
                             "position_age_candles": position_age_candles,
                             "position_age_minutes": position_age_minutes,
                             "entry_price": float(entry_price),
+                            "strategy_type": "range_mean_reversion",
+                            "version": "1.1.0",
                         },
                     )
 
@@ -224,6 +203,8 @@ class RangeMeanReversionStrategy(BaseStrategy):
                         "position_age_minutes": position_age_minutes,
                         "max_hold": self.max_hold_candles,
                         "entry_price": float(entry_price),
+                        "strategy_type": "range_mean_reversion",
+                        "version": "1.1.0",
                     },
                 )
 
@@ -247,6 +228,8 @@ class RangeMeanReversionStrategy(BaseStrategy):
                                 "entry_price": float(entry_price),
                                 "position_age_candles": position_age_candles,
                                 "position_age_minutes": position_age_minutes,
+                                "strategy_type": "range_mean_reversion",
+                                "version": "1.1.0",
                             },
                         )
                 else:  # short
@@ -267,6 +250,8 @@ class RangeMeanReversionStrategy(BaseStrategy):
                                 "entry_price": float(entry_price),
                                 "position_age_candles": position_age_candles,
                                 "position_age_minutes": position_age_minutes,
+                                "strategy_type": "range_mean_reversion",
+                                "version": "1.1.0",
                             },
                         )
 
@@ -274,6 +259,30 @@ class RangeMeanReversionStrategy(BaseStrategy):
             return None
 
         # === ENTRY LOGIC (only when flat) ===
+        # Entry requires sufficient history for technical indicators
+        min_bars = max(self.vwap_lookback, self.rsi_period, self.ema_filter_period) + 5
+        if len(history) < min_bars:
+            return None
+
+        # RSI calculation
+        rsi_vals = rsi(closes, self.rsi_period)
+        curr_rsi = rsi_vals[-1]
+
+        # EMA trend filter
+        ema_vals = ema(closes, self.ema_filter_period)
+        if len(ema_vals) < 6 or pd.isna(ema_vals[-1]):
+            return None
+
+        ema_slope = (ema_vals[-1] - ema_vals[-5]) / ema_vals[-5] * 100 if ema_vals[-5] else 0
+        trend_flat = abs(ema_slope) < 0.5
+
+        # ATR volatility filter
+        atr_vals = atr(highs, lows, closes, 14)
+        curr_atr = atr_vals[-1]
+        atr_pct = (curr_atr / curr_close) * 100 if curr_close else 0
+        if atr_pct > self.max_atr_pct:
+            return None
+
         long_cond = (
             deviation < -self.deviation_pct and
             curr_rsi < self.rsi_oversold and

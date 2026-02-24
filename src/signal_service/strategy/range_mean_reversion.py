@@ -1,13 +1,21 @@
-"""Range Mean Reversion Strategy with Exit Logic for live trading."""
+"""Range Mean Reversion strategy (VWAP proxy) for live/paper trading.
+
+Version: 1.1.0 - Adds VWAP-based exit logic matching backtest implementation.
+Exit conditions (priority order):
+1. VWAP Mean Reversion - price returns to VWAP
+2. Time-Based Exit - held too long without reversion
+3. Stop Loss - price moves further against position
+"""
 
 from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
+import numpy as np
 from structlog import get_logger
 
 from varon_fi import BaseStrategy, Signal, register
-from varon_fi.ta import atr, ema, rsi
+from varon_fi.ta import ema, atr, rsi
 
 logger = get_logger(__name__)
 
@@ -15,20 +23,16 @@ logger = get_logger(__name__)
 @register
 class RangeMeanReversionStrategy(BaseStrategy):
     """
-    Range Mean Reversion Scalper (VWAP Proxy) with Exit Logic
+    Range Mean Reversion Scalper (VWAP Proxy)
 
     Enters when price over-extends from short-term VWAP and
-    RSI shows extreme conditions. Exits near VWAP, at max hold time,
-    or via stop loss.
-
-    Version: 1.1.0 (adds exits)
+    RSI shows extreme conditions. Exits near VWAP.
     """
 
     name = "range_mean_reversion"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.utc = timezone.utc
 
         # Entry parameters
         self.vwap_lookback = int(self.params.get("vwap_lookback", 20))
@@ -45,11 +49,11 @@ class RangeMeanReversionStrategy(BaseStrategy):
         self.stop_loss_enabled = bool(self.params.get("stop_loss_enabled", True))
         self.stop_loss_multiplier = float(self.params.get("stop_loss_multiplier", 1.5))
 
-        # Track position state for exits (per symbol)
+        # Position tracking per symbol
         self._positions: dict[str, dict] = {}
 
     def _position_key(self, candle: dict) -> str:
-        """Generate position tracking key for symbol."""
+        """Get position key from candle or default to first symbol."""
         symbol = candle.get("symbol")
         if symbol:
             return symbol
@@ -57,20 +61,26 @@ class RangeMeanReversionStrategy(BaseStrategy):
             return self.symbols[0]
         return "default"
 
+    def _calculate_vwap(self, history: pd.DataFrame) -> float:
+        """Calculate current VWAP from history."""
+        hlc3 = (history["high"] + history["low"] + history["close"]) / 3
+        vwap_num = (hlc3 * history["volume"]).rolling(window=self.vwap_lookback).sum()
+        vwap_den = history["volume"].rolling(window=self.vwap_lookback).sum()
+        vwap_series = vwap_num / vwap_den
+        return float(vwap_series.iloc[-1])
+
     def _normalize_ts(self, ts) -> Optional[datetime]:
         """Normalize timestamps into timezone-aware UTC datetime."""
         if ts is None:
             return None
         if isinstance(ts, (int, float)):
-            dt = datetime.fromtimestamp(ts, self.utc)
+            dt = datetime.fromtimestamp(ts, timezone.utc)
         elif hasattr(ts, "seconds") and hasattr(ts, "nanos"):
-            dt = datetime.fromtimestamp(ts.seconds, self.utc)
+            dt = datetime.fromtimestamp(ts.seconds, timezone.utc)
         elif isinstance(ts, str):
             dt = pd.to_datetime(ts)
         elif isinstance(ts, datetime):
             dt = ts
-        elif hasattr(ts, "ToDatetime"):
-            dt = ts.ToDatetime(tzinfo=self.utc)
         else:
             return None
 
@@ -78,48 +88,18 @@ class RangeMeanReversionStrategy(BaseStrategy):
             dt = dt.to_pydatetime()
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=self.utc)
+            dt = dt.replace(tzinfo=timezone.utc)
         else:
-            dt = dt.astimezone(self.utc)
+            dt = dt.astimezone(timezone.utc)
         return dt
-
-    def _timeframe_minutes(self, timeframe: Optional[str]) -> Optional[int]:
-        """Convert a timeframe string like '5m' or '1h' into minutes."""
-        if not timeframe:
-            return None
-        tf = str(timeframe).strip().lower()
-        try:
-            if tf.endswith("m"):
-                minutes = int(tf[:-1])
-                return minutes if minutes > 0 else None
-            if tf.endswith("h"):
-                hours = int(tf[:-1])
-                return (hours * 60) if hours > 0 else None
-            if tf.endswith("d"):
-                days = int(tf[:-1]) if tf[:-1] else 1
-                return (days * 24 * 60) if days > 0 else None
-        except Exception:
-            return None
-        return None
-
-    def _compute_vwap(self, history: pd.DataFrame) -> Optional[float]:
-        """Compute rolling VWAP (HLC3 weighted by volume)."""
-        if len(history) < self.vwap_lookback:
-            return None
-
-        hlc3 = (history["high"] + history["low"] + history["close"]) / 3
-        vwap_num = (hlc3 * history["volume"]).rolling(window=self.vwap_lookback).sum()
-        vwap_den = history["volume"].rolling(window=self.vwap_lookback).sum()
-        vwap_series = vwap_num / vwap_den
-        curr_vwap = vwap_series.iloc[-1]
-        if pd.isna(curr_vwap):
-            return None
-        return float(curr_vwap)
 
     def on_candle(self, candle: dict, history: pd.DataFrame) -> Optional[Signal]:
         """Process new candle and return signal if conditions met."""
-        # Convert to DataFrame if needed and ensure numeric types
-        history = history.copy() if isinstance(history, pd.DataFrame) else pd.DataFrame(history)
+        if len(history) < 50:
+            return None
+
+        # Convert Decimal columns to float
+        history = history.copy()
         for col in ["open", "high", "low", "close", "volume"]:
             if col in history.columns:
                 history[col] = history[col].astype(float)
@@ -131,153 +111,26 @@ class RangeMeanReversionStrategy(BaseStrategy):
         if curr_close is None:
             return None
 
-        candle_ts = candle.get("timestamp") or candle.get("ts")
-        ts = self._normalize_ts(candle_ts)
-
-        key = self._position_key(candle)
-        position = self._positions.get(key)
-
-        # Compute VWAP if possible (used for both exits and entries)
-        curr_vwap = self._compute_vwap(history)
-
-        # === EXIT LOGIC (run even if history is short) ===
-        if position:
-            position_side = position.get("side")
-            entry_vwap = position.get("entry_vwap")
-            entry_deviation = position.get("entry_deviation")
-            entry_ts = position.get("entry_ts")
-
-            ref_vwap = curr_vwap or entry_vwap
-            deviation = None
-            if ref_vwap:
-                deviation = ((curr_close - ref_vwap) / ref_vwap) * 100
-
-            timeframe = candle.get("timeframe") or (self.timeframes[0] if self.timeframes else None)
-            tf_minutes = self._timeframe_minutes(timeframe)
-            position_age_minutes = None
-            position_age_candles = None
-            if ts and entry_ts:
-                position_age_minutes = (ts - entry_ts).total_seconds() / 60
-                if tf_minutes:
-                    position_age_candles = position_age_minutes / tf_minutes
-
-            # Exit 1: VWAP Mean Reversion - price returned to VWAP
-            if ref_vwap:
-                if position_side == "long" and curr_close >= ref_vwap * (1 - self.vwap_tolerance):
-                    self._positions.pop(key, None)
-                    return Signal(
-                        side="flat",
-                        price=curr_close,
-                        confidence=0.7,
-                        meta={
-                            "exit_reason": "vwap_mean_reversion",
-                            "vwap": float(ref_vwap),
-                            "close": float(curr_close),
-                            "position_age_minutes": position_age_minutes,
-                            "position_age_candles": position_age_candles,
-                            "strategy_type": "range_mean_reversion",
-                            "version": "1.1.0",
-                        },
-                    )
-                if position_side == "short" and curr_close <= ref_vwap * (1 + self.vwap_tolerance):
-                    self._positions.pop(key, None)
-                    return Signal(
-                        side="flat",
-                        price=curr_close,
-                        confidence=0.7,
-                        meta={
-                            "exit_reason": "vwap_mean_reversion",
-                            "vwap": float(ref_vwap),
-                            "close": float(curr_close),
-                            "position_age_minutes": position_age_minutes,
-                            "position_age_candles": position_age_candles,
-                            "strategy_type": "range_mean_reversion",
-                            "version": "1.1.0",
-                        },
-                    )
-
-            # Exit 2: Max Hold Time (timestamp-based)
-            if ts and entry_ts and tf_minutes and self.max_hold_candles:
-                max_hold_minutes = self.max_hold_candles * tf_minutes
-                if position_age_minutes is not None and position_age_minutes >= max_hold_minutes:
-                    self._positions.pop(key, None)
-                    return Signal(
-                        side="flat",
-                        price=curr_close,
-                        confidence=0.6,
-                        meta={
-                            "exit_reason": "max_hold_time",
-                            "vwap": float(ref_vwap) if ref_vwap else None,
-                            "close": float(curr_close),
-                            "position_age_minutes": position_age_minutes,
-                            "position_age_candles": position_age_candles,
-                            "max_hold": self.max_hold_candles,
-                            "max_hold_minutes": max_hold_minutes,
-                            "strategy_type": "range_mean_reversion",
-                            "version": "1.1.0",
-                        },
-                    )
-
-            # Exit 3: Stop Loss (if enabled)
-            if self.stop_loss_enabled and deviation is not None and entry_deviation is not None:
-                if position_side == "long":
-                    # For longs, we're below VWAP. If deviation increases, we're losing
-                    if deviation <= -(abs(entry_deviation) * self.stop_loss_multiplier):
-                        self._positions.pop(key, None)
-                        return Signal(
-                            side="flat",
-                            price=curr_close,
-                            confidence=0.65,
-                            meta={
-                                "exit_reason": "stop_loss",
-                                "vwap": float(ref_vwap) if ref_vwap else None,
-                                "close": float(curr_close),
-                                "deviation": float(deviation),
-                                "entry_deviation": float(entry_deviation),
-                                "strategy_type": "range_mean_reversion",
-                                "version": "1.1.0",
-                            },
-                        )
-                elif position_side == "short":
-                    # For shorts, we're above VWAP. If deviation increases, we're losing
-                    if deviation >= (abs(entry_deviation) * self.stop_loss_multiplier):
-                        self._positions.pop(key, None)
-                        return Signal(
-                            side="flat",
-                            price=curr_close,
-                            confidence=0.65,
-                            meta={
-                                "exit_reason": "stop_loss",
-                                "vwap": float(ref_vwap) if ref_vwap else None,
-                                "close": float(curr_close),
-                                "deviation": float(deviation),
-                                "entry_deviation": float(entry_deviation),
-                                "strategy_type": "range_mean_reversion",
-                                "version": "1.1.0",
-                            },
-                        )
-
-            return None
-
-        # === ENTRY LOGIC (only if no position) ===
+        # Ensure minimum bars for calculations
         min_bars = max(self.vwap_lookback, self.rsi_period, self.ema_filter_period) + 5
         if len(history) < min_bars:
-            return None
-
-        if curr_vwap is None:
             return None
 
         closes = history["close"].values
         highs = history["high"].values
         lows = history["low"].values
+        volumes = history["volume"].values
 
-        # RSI
+        # Calculate VWAP
+        curr_vwap = self._calculate_vwap(history)
+
+        # RSI calculation
         rsi_vals = rsi(closes, self.rsi_period)
         curr_rsi = rsi_vals[-1]
 
         # EMA trend filter
         ema_vals = ema(closes, self.ema_filter_period)
-        if len(ema_vals) < 6 or pd.isna(ema_vals[-1]) or pd.isna(ema_vals[-5]):
+        if len(ema_vals) < 6 or pd.isna(ema_vals[-1]):
             return None
 
         ema_slope = (ema_vals[-1] - ema_vals[-5]) / ema_vals[-5] * 100 if ema_vals[-5] else 0
@@ -286,38 +139,172 @@ class RangeMeanReversionStrategy(BaseStrategy):
         # ATR volatility filter
         atr_vals = atr(highs, lows, closes, 14)
         curr_atr = atr_vals[-1]
-        if curr_atr is None or pd.isna(curr_atr):
-            return None
-
         atr_pct = (curr_atr / curr_close) * 100 if curr_close else 0
         if atr_pct > self.max_atr_pct:
             return None
 
         # Deviation from VWAP
-        deviation = ((curr_close - curr_vwap) / curr_vwap) * 100
+        deviation = ((curr_close - curr_vwap) / curr_vwap) * 100 if curr_vwap else 0
 
-        long_cond = deviation < -self.deviation_pct and curr_rsi < self.rsi_oversold and trend_flat
-        short_cond = deviation > self.deviation_pct and curr_rsi > self.rsi_overbought and trend_flat
+        # Get position key and check for existing position
+        key = self._position_key(candle)
+        position = self._positions.get(key)
+
+        # === EXIT LOGIC ===
+        if position:
+            position_side = position["side"]
+            entry_ts = position.get("entry_ts")
+            entry_deviation = position.get("entry_deviation", 0)
+            entry_price = position.get("entry_price", curr_close)
+            entry_vwap = position.get("entry_vwap", curr_vwap)
+
+            # Calculate position age
+            position_age_candles = 0
+            position_age_minutes = 0
+            if entry_ts:
+                candle_ts = self._normalize_ts(candle.get("timestamp") or candle.get("ts"))
+                if candle_ts and entry_ts:
+                    # Assume 5m candles by default; timeframe could be parameterized
+                    timeframe_minutes = 5
+                    if "timeframe" in candle and candle["timeframe"]:
+                        tf = candle["timeframe"]
+                        if tf.endswith("m"):
+                            timeframe_minutes = int(tf[:-1])
+                        elif tf.endswith("h"):
+                            timeframe_minutes = int(tf[:-1]) * 60
+                    position_age_minutes = int((candle_ts - entry_ts).total_seconds() / 60)
+                    position_age_candles = position_age_minutes // timeframe_minutes
+
+            # Exit 1: VWAP Mean Reversion (primary)
+            if position_side == "long":
+                if curr_close >= curr_vwap * (1 - self.vwap_tolerance):
+                    self._positions.pop(key, None)
+                    return Signal(
+                        side="flat",
+                        price=float(curr_close),
+                        confidence=0.6,
+                        meta={
+                            "exit_reason": "vwap_mean_reversion",
+                            "vwap": float(curr_vwap),
+                            "close": float(curr_close),
+                            "position_age_candles": position_age_candles,
+                            "position_age_minutes": position_age_minutes,
+                            "entry_price": float(entry_price),
+                        },
+                    )
+            else:  # short
+                if curr_close <= curr_vwap * (1 + self.vwap_tolerance):
+                    self._positions.pop(key, None)
+                    return Signal(
+                        side="flat",
+                        price=float(curr_close),
+                        confidence=0.6,
+                        meta={
+                            "exit_reason": "vwap_mean_reversion",
+                            "vwap": float(curr_vwap),
+                            "close": float(curr_close),
+                            "position_age_candles": position_age_candles,
+                            "position_age_minutes": position_age_minutes,
+                            "entry_price": float(entry_price),
+                        },
+                    )
+
+            # Exit 2: Time-Based Exit (max hold candles)
+            if position_age_candles >= self.max_hold_candles:
+                self._positions.pop(key, None)
+                return Signal(
+                    side="flat",
+                    price=float(curr_close),
+                    confidence=0.55,
+                    meta={
+                        "exit_reason": "max_hold_time",
+                        "vwap": float(curr_vwap),
+                        "close": float(curr_close),
+                        "position_age_candles": position_age_candles,
+                        "position_age_minutes": position_age_minutes,
+                        "max_hold": self.max_hold_candles,
+                        "entry_price": float(entry_price),
+                    },
+                )
+
+            # Exit 3: Stop Loss
+            if self.stop_loss_enabled and entry_deviation != 0:
+                if position_side == "long":
+                    # Long stop: deviation worsens beyond multiplier of entry deviation
+                    if deviation <= -(abs(entry_deviation) * self.stop_loss_multiplier):
+                        self._positions.pop(key, None)
+                        return Signal(
+                            side="flat",
+                            price=float(curr_close),
+                            confidence=0.55,
+                            meta={
+                                "exit_reason": "stop_loss",
+                                "vwap": float(curr_vwap),
+                                "close": float(curr_close),
+                                "deviation": float(deviation),
+                                "entry_deviation": float(entry_deviation),
+                                "stop_loss_multiplier": self.stop_loss_multiplier,
+                                "entry_price": float(entry_price),
+                                "position_age_candles": position_age_candles,
+                                "position_age_minutes": position_age_minutes,
+                            },
+                        )
+                else:  # short
+                    # Short stop: deviation worsens beyond multiplier of entry deviation
+                    if deviation >= (abs(entry_deviation) * self.stop_loss_multiplier):
+                        self._positions.pop(key, None)
+                        return Signal(
+                            side="flat",
+                            price=float(curr_close),
+                            confidence=0.55,
+                            meta={
+                                "exit_reason": "stop_loss",
+                                "vwap": float(curr_vwap),
+                                "close": float(curr_close),
+                                "deviation": float(deviation),
+                                "entry_deviation": float(entry_deviation),
+                                "stop_loss_multiplier": self.stop_loss_multiplier,
+                                "entry_price": float(entry_price),
+                                "position_age_candles": position_age_candles,
+                                "position_age_minutes": position_age_minutes,
+                            },
+                        )
+
+            # No exit condition met, stay in position
+            return None
+
+        # === ENTRY LOGIC (only when flat) ===
+        long_cond = (
+            deviation < -self.deviation_pct and
+            curr_rsi < self.rsi_oversold and
+            trend_flat
+        )
+
+        short_cond = (
+            deviation > self.deviation_pct and
+            curr_rsi > self.rsi_overbought and
+            trend_flat
+        )
+
+        ts = self._normalize_ts(candle.get("timestamp") or candle.get("ts"))
 
         if long_cond:
             self._positions[key] = {
                 "side": "long",
                 "entry_vwap": float(curr_vwap),
                 "entry_deviation": float(deviation),
-                "entry_price": curr_close,
-                "entry_ts": ts or datetime.now(self.utc),
+                "entry_ts": ts or datetime.now(timezone.utc),
+                "entry_price": float(curr_close),
             }
             return Signal(
                 side="long",
-                price=curr_close,
-                confidence=min(0.5 + abs(deviation) / 10, 0.9),
+                price=float(curr_close),
+                confidence=0.6,
                 meta={
                     "vwap": float(curr_vwap),
                     "deviation_pct": float(deviation),
                     "rsi": float(curr_rsi),
                     "atr_pct": float(atr_pct),
-                    "strategy_type": "range_mean_reversion",
-                    "version": "1.1.0",
                     "exit_rules": {
                         "vwap_tolerance": self.vwap_tolerance,
                         "max_hold_candles": self.max_hold_candles,
@@ -332,20 +319,18 @@ class RangeMeanReversionStrategy(BaseStrategy):
                 "side": "short",
                 "entry_vwap": float(curr_vwap),
                 "entry_deviation": float(deviation),
-                "entry_price": curr_close,
-                "entry_ts": ts or datetime.now(self.utc),
+                "entry_ts": ts or datetime.now(timezone.utc),
+                "entry_price": float(curr_close),
             }
             return Signal(
                 side="short",
-                price=curr_close,
-                confidence=min(0.5 + abs(deviation) / 10, 0.9),
+                price=float(curr_close),
+                confidence=0.6,
                 meta={
                     "vwap": float(curr_vwap),
                     "deviation_pct": float(deviation),
                     "rsi": float(curr_rsi),
                     "atr_pct": float(atr_pct),
-                    "strategy_type": "range_mean_reversion",
-                    "version": "1.1.0",
                     "exit_rules": {
                         "vwap_tolerance": self.vwap_tolerance,
                         "max_hold_candles": self.max_hold_candles,

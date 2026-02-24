@@ -1,557 +1,406 @@
-"""Tests for Range Mean Reversion Strategy with Exit Logic."""
+"""Tests for RangeMeanReversionStrategy with exit logic."""
 
 import pytest
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 
 from signal_service.strategy.range_mean_reversion import RangeMeanReversionStrategy
 
 
-class TestRangeMeanReversionStrategy:
-    """Test Range Mean Reversion Strategy with Exit Logic."""
+class TestRangeMeanReversionExits:
+    """Test exit logic for RangeMeanReversionStrategy."""
 
-    @pytest.fixture
-    def default_params(self):
-        """Default test-friendly strategy parameters."""
+    def create_history(self, n_bars=50, base_price=100.0):
+        """Create sample OHLCV history."""
+        timestamps = pd.date_range(
+            start="2026-02-24 09:00:00",
+            periods=n_bars,
+            freq="5min",
+            tz="UTC"
+        )
+
+        data = {
+            "timestamp": timestamps,
+            "open": [base_price] * n_bars,
+            "high": [base_price * 1.01] * n_bars,
+            "low": [base_price * 0.99] * n_bars,
+            "close": [base_price] * n_bars,
+            "volume": [1000.0] * n_bars,
+        }
+        return pd.DataFrame(data)
+
+    def create_candle(self, close, timestamp=None, base_price=100.0):
+        """Create a sample candle."""
+        if timestamp is None:
+            timestamp = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
         return {
-            # Entry parameters
-            "vwap_lookback": 20,
-            "rsi_period": 14,
-            "rsi_oversold": 30,
-            "rsi_overbought": 70,
-            "deviation_pct": 1.0,
-            "ema_filter_period": 50,
-            "max_atr_pct": 2.0,
-            # Exit parameters (v1.1.0)
+            "timestamp": timestamp,
+            "open": base_price,
+            "high": base_price * 1.01,
+            "low": base_price * 0.99,
+            "close": close,
+            "volume": 1000.0,
+        }
+
+    def test_exit_logic_runs_with_limited_history(self):
+        """Exit logic should run even when history < min_bars for entry."""
+        strategy = RangeMeanReversionStrategy(params={
             "vwap_tolerance": 0.002,
-            "max_hold_candles": 15,
+            "max_hold_minutes": 75,
             "stop_loss_enabled": True,
             "stop_loss_multiplier": 1.5,
-        }
+        })
 
-    @pytest.fixture
-    def strategy(self, default_params):
-        """Create strategy instance with test-friendly params."""
-        return RangeMeanReversionStrategy(
-            strategy_id="test-123",
-            name="range_mean_reversion",
-            version="1.1.0",
-            symbols=["BTC"],
-            timeframes=["5m"],
-            params=default_params,
-        )
+        # Create minimal history (less than min_bars for entry)
+        history = self.create_history(n_bars=10, base_price=100.0)
 
-    def create_history(
-        self,
-        n_bars=200,
-        base_price=50000,
-        trend="flat",
-        volatility=0.001,
-        volume_mean=1000,
-    ):
-        """Create sample OHLC history with specified characteristics."""
-        np.random.seed(42)
-        timestamps = [
-            datetime.now(timezone.utc) - timedelta(minutes=5 * (n_bars - i))
-            for i in range(n_bars)
-        ]
+        # Simulate entry
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
 
-        if trend == "flat":
-            prices = base_price * (1 + np.random.normal(0, volatility, n_bars))
-        elif trend == "up":
-            prices = base_price * (1 + np.linspace(0, 0.05, n_bars) + np.random.normal(0, volatility, n_bars))
-        elif trend == "down":
-            prices = base_price * (1 - np.linspace(0, 0.05, n_bars) + np.random.normal(0, volatility, n_bars))
-        else:
-            prices = base_price * (1 + np.random.normal(0, volatility, n_bars))
-
-        df = pd.DataFrame(
-            {
-                "timestamp": timestamps,
-                "open": prices * (1 + np.random.normal(0, volatility * 0.5, n_bars)),
-                "high": prices * (1 + abs(np.random.normal(0, volatility, n_bars))),
-                "low": prices * (1 - abs(np.random.normal(0, volatility, n_bars))),
-                "close": prices,
-                "volume": np.random.uniform(volume_mean * 0.5, volume_mean * 1.5, n_bars),
-            }
-        )
-        return df
-
-    def create_extreme_conditions_history(
-        self,
-        n_bars=200,
-        base_price=50000,
-        condition="oversold",  # "oversold" or "overbought"
-        deviation_pct=2.0,
-    ):
-        """Create history with extreme RSI and VWAP deviation conditions."""
-        np.random.seed(42)
-        timestamps = [
-            datetime.now(timezone.utc) - timedelta(minutes=5 * (n_bars - i))
-            for i in range(n_bars)
-        ]
-
-        # Create a flat base with a dip/spike at the end
-        prices = np.full(n_bars, base_price, dtype=float)
-        
-        # Add the deviation at the end
-        if condition == "oversold":
-            # Price drops below VWAP for long entry
-            deviation_factor = 1 - (deviation_pct / 100)
-            prices[-20:] = base_price * np.linspace(1.0, deviation_factor, 20)
-        else:  # overbought
-            # Price rises above VWAP for short entry
-            deviation_factor = 1 + (deviation_pct / 100)
-            prices[-20:] = base_price * np.linspace(1.0, deviation_factor, 20)
-
-        # Add some noise
-        prices = prices * (1 + np.random.normal(0, 0.001, n_bars))
-
-        df = pd.DataFrame(
-            {
-                "timestamp": timestamps,
-                "open": prices * (1 + np.random.normal(0, 0.0005, n_bars)),
-                "high": prices * (1 + abs(np.random.normal(0, 0.001, n_bars))),
-                "low": prices * (1 - abs(np.random.normal(0, 0.001, n_bars))),
-                "close": prices,
-                "volume": np.random.uniform(500, 1500, n_bars),
-            }
-        )
-        return df
-
-    def test_strategy_creation(self, strategy, default_params):
-        """Test strategy initialization with parameters."""
-        assert strategy.name == "range_mean_reversion"
-        assert strategy.version == "1.1.0"
-        
-        # Entry parameters
-        assert strategy.vwap_lookback == default_params["vwap_lookback"]
-        assert strategy.rsi_period == default_params["rsi_period"]
-        assert strategy.rsi_oversold == default_params["rsi_oversold"]
-        assert strategy.rsi_overbought == default_params["rsi_overbought"]
-        assert strategy.deviation_pct == default_params["deviation_pct"]
-        assert strategy.ema_filter_period == default_params["ema_filter_period"]
-        assert strategy.max_atr_pct == default_params["max_atr_pct"]
-        
-        # Exit parameters (v1.1.0)
-        assert strategy.vwap_tolerance == default_params["vwap_tolerance"]
-        assert strategy.max_hold_candles == default_params["max_hold_candles"]
-        assert strategy.stop_loss_enabled == default_params["stop_loss_enabled"]
-        assert strategy.stop_loss_multiplier == default_params["stop_loss_multiplier"]
-
-    def test_insufficient_history(self, strategy):
-        """Should return None when not enough history."""
-        candle = {
-            "timestamp": datetime.now(timezone.utc),
-            "symbol": "BTC",
-            "open": 50000,
-            "high": 50100,
-            "low": 49900,
-            "close": 50000,
-            "volume": 1000,
-        }
-        history = pd.DataFrame(
-            {
-                "timestamp": [datetime.now(timezone.utc) - timedelta(minutes=5)],
-                "open": [50000],
-                "high": [50100],
-                "low": [49900],
-                "close": [50000],
-                "volume": [1000],
-            }
-        )
+        # Price returns to VWAP - should exit even with limited history
+        candle = self.create_candle(close=99.9, timestamp=entry_ts + timedelta(minutes=10))
         signal = strategy.on_candle(candle, history)
-        assert signal is None
 
-    def test_high_volatility_filter(self, strategy):
-        """Should return None when volatility is too high."""
-        # Create history with high volatility
-        history = self.create_history(n_bars=200, volatility=0.05)  # Very high volatility
-        
-        candle = {
-            "timestamp": datetime.now(timezone.utc),
-            "symbol": "BTC",
-            "open": 50000,
-            "high": 52500,
-            "low": 47500,
-            "close": 50000,
-            "volume": 1000,
-        }
-        
-        signal = strategy.on_candle(candle, history)
-        assert signal is None  # Filtered by ATR
-
-    def test_exit_on_vwap_mean_reversion_long(self, strategy):
-        """Exit long position when price returns to VWAP."""
-        now = datetime.now(timezone.utc)
-        
-        # Setup: In a long position, price was below VWAP
-        history = self.create_history(n_bars=200, base_price=50000, trend="flat")
-        current_close = 50200  # Price back to/near VWAP
-        
-        strategy._positions["BTC"] = {
-            "side": "long",
-            "entry_vwap": 50000,
-            "entry_deviation": -2.0,
-            "entry_bar_idx": 180,
-            "entry_price": 49000,
-        }
-        
-        candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": 50100,
-            "high": 50250,
-            "low": 50050,
-            "close": current_close,
-            "volume": 1000,
-        }
-        
-        signal = strategy.on_candle(candle, history)
-        assert signal is not None
-        assert signal.side == "flat"
-        assert signal.meta.get("exit_reason") == "vwap_mean_reversion"
-        assert "vwap" in signal.meta
-        assert "position_age" in signal.meta
-
-    def test_exit_on_vwap_mean_reversion_short(self, strategy):
-        """Exit short position when price returns to VWAP."""
-        now = datetime.now(timezone.utc)
-        
-        history = self.create_history(n_bars=200, base_price=50000, trend="flat")
-        current_close = 49800  # Price back to/near VWAP
-        
-        strategy._positions["BTC"] = {
-            "side": "short",
-            "entry_vwap": 50000,
-            "entry_deviation": 2.0,
-            "entry_bar_idx": 180,
-            "entry_price": 51000,
-        }
-        
-        candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": 49900,
-            "high": 49950,
-            "low": 49750,
-            "close": current_close,
-            "volume": 1000,
-        }
-        
-        signal = strategy.on_candle(candle, history)
         assert signal is not None
         assert signal.side == "flat"
         assert signal.meta.get("exit_reason") == "vwap_mean_reversion"
 
-    def test_exit_on_max_hold_time(self, strategy):
-        """Exit position when max hold candles reached."""
-        now = datetime.now(timezone.utc)
-        
-        history = self.create_history(n_bars=200, base_price=50000, trend="flat")
-        
-        strategy._positions["BTC"] = {
-            "side": "long",
-            "entry_vwap": 50000,
-            "entry_deviation": -1.5,
-            "entry_bar_idx": 184,  # 16 candles ago (exceeds max_hold_candles=15)
-            "entry_price": 49250,
-        }
-        
-        candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": 49200,
-            "high": 49300,
-            "low": 49100,
-            "close": 49200,  # Still below VWAP
-            "volume": 1000,
-        }
-        
+    def test_vwap_mean_reversion_exit_long(self):
+        """Test VWAP mean reversion exit for long position."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+        })
+
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Enter long below VWAP
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
+
+        # Price rises to VWAP (99.9 >= 100 * 0.998 = 99.8) - should exit
+        candle = self.create_candle(close=99.9, timestamp=entry_ts + timedelta(minutes=10))
         signal = strategy.on_candle(candle, history)
+
+        assert signal is not None
+        assert signal.side == "flat"
+        assert signal.meta.get("exit_reason") == "vwap_mean_reversion"
+
+    def test_vwap_mean_reversion_exit_short(self):
+        """Test VWAP mean reversion exit for short position."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+        })
+
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Enter short above VWAP
+        strategy._set_position("short", 102.0, 100.0, 2.0, entry_ts)
+
+        # Price falls to VWAP (100.1 <= 100 * 1.002 = 100.2) - should exit
+        candle = self.create_candle(close=100.1, timestamp=entry_ts + timedelta(minutes=10))
+        signal = strategy.on_candle(candle, history)
+
+        assert signal is not None
+        assert signal.side == "flat"
+        assert signal.meta.get("exit_reason") == "vwap_mean_reversion"
+
+    def test_no_vwap_exit_when_price_not_at_vwap(self):
+        """Should not exit if price hasn't returned to VWAP."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+            "max_hold_minutes": 75,
+        })
+
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
+
+        # Price at 99.0 (below threshold 99.8) - should NOT exit via VWAP
+        # But within max_hold time - no exit at all
+        candle = self.create_candle(close=99.0, timestamp=entry_ts + timedelta(minutes=10))
+        signal = strategy.on_candle(candle, history)
+
+        assert signal is None  # No exit
+
+    def test_timestamp_based_max_hold_exit(self):
+        """Test time-based exit using timestamp (not bar index)."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+            "max_hold_minutes": 30,  # 30 minutes max hold
+        })
+
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
+
+        # After 31 minutes - should exit via time
+        exit_ts = entry_ts + timedelta(minutes=31)
+        candle = self.create_candle(close=99.0, timestamp=exit_ts)
+        signal = strategy.on_candle(candle, history)
+
         assert signal is not None
         assert signal.side == "flat"
         assert signal.meta.get("exit_reason") == "max_hold_time"
-        assert signal.meta.get("max_hold") == strategy.max_hold_candles
+        assert signal.meta.get("hold_minutes") == 31
 
-    def test_exit_on_stop_loss_long(self, strategy):
-        """Exit long position when stop loss is hit."""
-        now = datetime.now(timezone.utc)
-        
-        # Create history with known VWAP baseline
-        np.random.seed(42)
-        n_bars = 200
-        base_price = 50000
-        timestamps = [
-            datetime.now(timezone.utc) - timedelta(minutes=5 * (n_bars - i))
-            for i in range(n_bars)
-        ]
-        
-        # Create flat price history at base_price
-        prices = np.full(n_bars, base_price, dtype=float)
-        # Small noise for EMA/RSI calculations
-        prices = prices * (1 + np.random.normal(0, 0.0001, n_bars))
-        
-        history = pd.DataFrame(
-            {
-                "timestamp": timestamps,
-                "open": prices * 0.999,
-                "high": prices * 1.001,
-                "low": prices * 0.999,
-                "close": prices,
-                "volume": np.full(n_bars, 1000.0),
-            }
-        )
-        
-        entry_deviation = -2.0
-        strategy._positions["BTC"] = {
-            "side": "long",
-            "entry_vwap": base_price,
-            "entry_deviation": entry_deviation,
-            "entry_bar_idx": 190,
-            "entry_price": base_price * 0.98,
-        }
-        
-        # Price moved further away from VWAP (worse for long)
-        # deviation should be <= -(abs(entry_deviation) * stop_loss_multiplier)
-        # i.e., deviation <= -(2.0 * 1.5) = -3.0
-        # So current_close should be <= base_price * (1 - 0.03) = 48500
-        current_close = base_price * 0.96  # 4% below VWAP to be safe
-        
-        candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": current_close * 1.002,
-            "high": current_close * 1.002,
-            "low": current_close * 0.998,
-            "close": current_close,
-            "volume": 1000,
-        }
-        
-        signal = strategy.on_candle(candle, history)
-        assert signal is not None
-        assert signal.side == "flat"
-        assert signal.meta.get("exit_reason") == "stop_loss"
-        assert "entry_deviation" in signal.meta
-        assert "deviation" in signal.meta
+    def test_no_time_exit_within_max_hold(self):
+        """Should not time-exit if within max_hold_minutes."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+            "max_hold_minutes": 75,
+        })
 
-    def test_exit_on_stop_loss_short(self, strategy):
-        """Exit short position when stop loss is hit."""
-        now = datetime.now(timezone.utc)
-        
-        # Create history with known VWAP baseline
-        np.random.seed(42)
-        n_bars = 200
-        base_price = 50000
-        timestamps = [
-            datetime.now(timezone.utc) - timedelta(minutes=5 * (n_bars - i))
-            for i in range(n_bars)
-        ]
-        
-        # Create flat price history at base_price
-        prices = np.full(n_bars, base_price, dtype=float)
-        # Small noise for EMA/RSI calculations
-        prices = prices * (1 + np.random.normal(0, 0.0001, n_bars))
-        
-        history = pd.DataFrame(
-            {
-                "timestamp": timestamps,
-                "open": prices * 0.999,
-                "high": prices * 1.001,
-                "low": prices * 0.999,
-                "close": prices,
-                "volume": np.full(n_bars, 1000.0),
-            }
-        )
-        
-        entry_deviation = 2.0
-        strategy._positions["BTC"] = {
-            "side": "short",
-            "entry_vwap": base_price,
-            "entry_deviation": entry_deviation,
-            "entry_bar_idx": 190,
-            "entry_price": base_price * 1.02,
-        }
-        
-        # Price moved further away from VWAP (worse for short)
-        # deviation should be >= (abs(entry_deviation) * stop_loss_multiplier)
-        # i.e., deviation >= (2.0 * 1.5) = 3.0
-        current_close = base_price * 1.03  # 3% above VWAP = stop loss
-        
-        candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": current_close * 0.998,
-            "high": current_close * 1.002,
-            "low": current_close * 0.998,
-            "close": current_close,
-            "volume": 1000,
-        }
-        
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
+
+        # After 30 minutes - within 75 min max hold
+        exit_ts = entry_ts + timedelta(minutes=30)
+        candle = self.create_candle(close=99.0, timestamp=exit_ts)
         signal = strategy.on_candle(candle, history)
+
+        assert signal is None  # No exit
+
+    def test_stop_loss_exit_long(self):
+        """Test stop loss exit for long position."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+            "max_hold_minutes": 75,
+            "stop_loss_enabled": True,
+            "stop_loss_multiplier": 1.5,
+        })
+
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Long entered at 2% below VWAP
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
+
+        # Stop at 1.5x deviation = 3% below VWAP = 97.0
+        # Price at 96.5 - should trigger stop
+        candle = self.create_candle(close=96.5, timestamp=entry_ts + timedelta(minutes=10))
+        signal = strategy.on_candle(candle, history)
+
         assert signal is not None
         assert signal.side == "flat"
         assert signal.meta.get("exit_reason") == "stop_loss"
 
-    def test_stop_loss_disabled(self, strategy):
-        """Should not exit on stop loss when disabled."""
-        now = datetime.now(timezone.utc)
-        
-        strategy.stop_loss_enabled = False
-        history = self.create_history(n_bars=200, base_price=50000, trend="flat")
-        
-        strategy._positions["BTC"] = {
-            "side": "long",
-            "entry_vwap": 50000,
-            "entry_deviation": -2.0,
-            "entry_bar_idx": 190,
-            "entry_price": 49000,
-        }
-        
-        # Price at stop loss level
-        candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": 48500,
-            "high": 48500,
-            "low": 48400,
-            "close": 48500,
-            "volume": 1000,
-        }
-        
-        signal = strategy.on_candle(candle, history)
-        # Should not exit due to stop loss (disabled), but may exit due to max hold or other reasons
-        if signal is not None:
-            assert signal.meta.get("exit_reason") != "stop_loss"
+    def test_stop_loss_exit_short(self):
+        """Test stop loss exit for short position."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+            "max_hold_minutes": 75,
+            "stop_loss_enabled": True,
+            "stop_loss_multiplier": 1.5,
+        })
 
-    def test_no_exit_when_conditions_not_met(self, strategy):
-        """Should not exit when no exit conditions are met."""
-        now = datetime.now(timezone.utc)
-        
-        history = self.create_history(n_bars=200, base_price=50000, trend="flat")
-        
-        strategy._positions["BTC"] = {
-            "side": "long",
-            "entry_vwap": 50000,
-            "entry_deviation": -1.5,
-            "entry_bar_idx": 195,  # Only 5 candles ago
-            "entry_price": 49250,
-        }
-        
-        # Price still below VWAP, not at stop loss, not at max hold
-        candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": 49200,
-            "high": 49300,
-            "low": 49100,
-            "close": 49200,
-            "volume": 1000,
-        }
-        
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Short entered at 2% above VWAP
+        strategy._set_position("short", 102.0, 100.0, 2.0, entry_ts)
+
+        # Stop at 1.5x deviation = 3% above VWAP = 103.0
+        # Price at 103.5 - should trigger stop
+        candle = self.create_candle(close=103.5, timestamp=entry_ts + timedelta(minutes=10))
         signal = strategy.on_candle(candle, history)
+
+        assert signal is not None
+        assert signal.side == "flat"
+        assert signal.meta.get("exit_reason") == "stop_loss"
+
+    def test_no_stop_loss_when_disabled(self):
+        """Should not stop out if stop_loss is disabled."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+            "max_hold_minutes": 75,
+            "stop_loss_enabled": False,
+            "stop_loss_multiplier": 1.5,
+        })
+
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
+
+        # Price way below stop threshold
+        candle = self.create_candle(close=90.0, timestamp=entry_ts + timedelta(minutes=10))
+        signal = strategy.on_candle(candle, history)
+
+        assert signal is None  # No stop loss exit
+
+    def test_entry_requires_full_history(self):
+        """Entry should require min_bars of history."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_lookback": 20,
+            "rsi_period": 14,
+            "ema_filter_period": 50,
+        })
+
+        # Not enough history for entry (need 50+5=55 bars)
+        history = self.create_history(n_bars=30, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        # No position - try to enter with insufficient history
+        candle = self.create_candle(close=98.0, timestamp=entry_ts)
+        signal = strategy.on_candle(candle, history)
+
+        assert signal is None  # No entry
+
+    def test_position_reset_after_exit(self):
+        """Position state should reset after exit."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_tolerance": 0.002,
+        })
+
+        history = self.create_history(n_bars=50, base_price=100.0)
+        entry_ts = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        strategy._set_position("long", 98.0, 100.0, -2.0, entry_ts)
+        assert strategy._position is not None
+
+        # Exit
+        candle = self.create_candle(close=99.9, timestamp=entry_ts + timedelta(minutes=10))
+        signal = strategy.on_candle(candle, history)
+
+        assert signal is not None
+        assert strategy._position is None  # Reset after exit
+
+
+class TestRangeMeanReversionEntry:
+    """Test entry logic for RangeMeanReversionStrategy."""
+
+    def create_history(self, n_bars=60, trend="flat"):
+        """Create sample OHLCV history with optional trend."""
+        timestamps = pd.date_range(
+            start="2026-02-24 09:00:00",
+            periods=n_bars,
+            freq="5min",
+            tz="UTC"
+        )
+
+        base_price = 100.0
+        closes = []
+        for i in range(n_bars):
+            if trend == "flat":
+                closes.append(base_price)
+            elif trend == "up":
+                closes.append(base_price + i * 0.1)
+            elif trend == "down":
+                closes.append(base_price - i * 0.1)
+
+        data = {
+            "timestamp": timestamps,
+            "open": [c * 0.99 for c in closes],
+            "high": [c * 1.01 for c in closes],
+            "low": [c * 0.99 for c in closes],
+            "close": closes,
+            "volume": [1000.0] * n_bars,
+        }
+        return pd.DataFrame(data)
+
+    def create_oversold_candle(self, close, timestamp=None):
+        """Create a candle that looks oversold (for long entry)."""
+        if timestamp is None:
+            timestamp = datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc)
+        return {
+            "timestamp": timestamp,
+            "open": close * 1.01,
+            "high": close * 1.02,
+            "low": close * 0.98,
+            "close": close,
+            "volume": 5000.0,  # Higher volume
+        }
+
+    def test_long_entry_conditions(self):
+        """Test long entry with oversold conditions."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_lookback": 20,
+            "rsi_period": 14,
+            "rsi_oversold": 30,
+            "deviation_pct": 1.0,
+        })
+
+        # Flat trend history
+        history = self.create_history(n_bars=60, trend="flat")
+
+        # Oversold candle far below VWAP
+        candle = self.create_oversold_candle(close=98.0)
+        signal = strategy.on_candle(candle, history)
+
+        # Should enter long
+        assert signal is not None
+        assert signal.side == "long"
+        assert "vwap" in signal.meta
+        assert "deviation_pct" in signal.meta
+
+    def test_no_entry_in_strong_trend(self):
+        """Should not enter when trend is not flat."""
+        strategy = RangeMeanReversionStrategy(params={
+            "ema_filter_period": 50,
+        })
+
+        # Strong uptrend - EMA slope will be steep
+        history = self.create_history(n_bars=60, trend="up")
+
+        candle = {
+            "timestamp": datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc),
+            "open": 98.0,
+            "high": 99.0,
+            "low": 97.0,
+            "close": 98.0,
+            "volume": 1000.0,
+        }
+        signal = strategy.on_candle(candle, history)
+
+        # Should not enter due to trend filter
         assert signal is None
 
-    def test_signal_metadata_includes_exit_rules(self, strategy):
-        """Entry signals should include exit rule configuration in metadata."""
-        # This test verifies that entry signals contain the exit rules
-        # We'll create conditions that would trigger an entry
-        
-        # Create history with oversold conditions
-        history = self.create_extreme_conditions_history(
-            n_bars=200,
-            base_price=50000,
-            condition="oversold",
-            deviation_pct=3.0,  # Exceeds deviation_pct=1.0
-        )
-        
-        # Force RSI to be very low (oversold)
-        # RSI calculation is complex, so we'll manually verify the structure
-        
-        candle = {
-            "timestamp": datetime.now(timezone.utc),
-            "symbol": "BTC",
-            "open": 48500,
-            "high": 48600,
-            "low": 48400,
-            "close": 48500,
-            "volume": 1000,
-        }
-        
-        # Note: We can't reliably trigger entry in unit tests due to RSI/EMA complexity
-        # This test documents the expected metadata structure
-        expected_exit_rules = {
-            "vwap_tolerance": strategy.vwap_tolerance,
-            "max_hold_candles": strategy.max_hold_candles,
-            "stop_loss_enabled": strategy.stop_loss_enabled,
-            "stop_loss_multiplier": strategy.stop_loss_multiplier,
-        }
-        
-        # Verify the strategy has the exit rules configured
-        assert strategy.vwap_tolerance == expected_exit_rules["vwap_tolerance"]
-        assert strategy.max_hold_candles == expected_exit_rules["max_hold_candles"]
-        assert strategy.stop_loss_enabled == expected_exit_rules["stop_loss_enabled"]
-        assert strategy.stop_loss_multiplier == expected_exit_rules["stop_loss_multiplier"]
+    def test_short_entry_conditions(self):
+        """Test short entry with overbought conditions."""
+        strategy = RangeMeanReversionStrategy(params={
+            "vwap_lookback": 20,
+            "rsi_period": 14,
+            "rsi_overbought": 70,
+            "deviation_pct": 1.0,
+        })
 
-    def test_position_tracking(self, strategy):
-        """Verify position state is tracked correctly on entry."""
-        now = datetime.now(timezone.utc)
-        
-        history = self.create_history(n_bars=200, base_price=50000, trend="flat")
-        
-        # Manually set position
-        strategy._positions["BTC"] = {
-            "side": "long",
-            "entry_vwap": 50000.0,
-            "entry_deviation": -2.0,
-            "entry_bar_idx": 190,
-            "entry_price": 49000.0,
-        }
-        
-        # Verify position is tracked
-        assert "BTC" in strategy._positions
-        assert strategy._positions["BTC"]["side"] == "long"
-        assert strategy._positions["BTC"]["entry_vwap"] == 50000.0
-        assert strategy._positions["BTC"]["entry_deviation"] == -2.0
-        
-        # Exit the position
+        history = self.create_history(n_bars=60, trend="flat")
+
+        # Overbought candle far above VWAP
         candle = {
-            "timestamp": now,
-            "symbol": "BTC",
-            "open": 50050,
-            "high": 50100,
-            "low": 49950,
-            "close": 50050,  # Above VWAP tolerance
-            "volume": 1000,
+            "timestamp": datetime(2026, 2, 24, 12, 0, 0, tzinfo=timezone.utc),
+            "open": 102.0,
+            "high": 103.0,
+            "low": 101.0,
+            "close": 102.0,
+            "volume": 5000.0,
         }
-        
         signal = strategy.on_candle(candle, history)
-        assert signal is not None
-        assert signal.side == "flat"
-        
-        # Verify position is cleared
-        assert "BTC" not in strategy._positions
 
-    def test_multiple_symbols_position_tracking(self, strategy):
-        """Verify separate position tracking for multiple symbols."""
-        strategy.symbols = ["BTC", "ETH"]
-        
-        # Set positions for different symbols
-        strategy._positions["BTC"] = {
-            "side": "long",
-            "entry_vwap": 50000.0,
-            "entry_deviation": -2.0,
-            "entry_bar_idx": 190,
-            "entry_price": 49000.0,
-        }
-        strategy._positions["ETH"] = {
-            "side": "short",
-            "entry_vwap": 3000.0,
-            "entry_deviation": 2.0,
-            "entry_bar_idx": 190,
-            "entry_price": 3060.0,
-        }
-        
-        assert strategy._positions["BTC"]["side"] == "long"
-        assert strategy._positions["ETH"]["side"] == "short"
+        # Should enter short
+        assert signal is not None
+        assert signal.side == "short"
+
+    def test_atr_filter_blocks_entry(self):
+        """High ATR should block entry."""
+        strategy = RangeMeanReversionStrategy(params={
+            "max_atr_pct": 0.5,  # Very strict ATR filter
+        })
+
+        history = self.create_history(n_bars=60, trend="flat")
+        # Make history more volatile
+        history["high"] = history["close"] * 1.05
+        history["low"] = history["close"] * 0.95
+
+        candle = self.create_oversold_candle(close=98.0)
+        signal = strategy.on_candle(candle, history)
+
+        # Should not enter due to high ATR
+        assert signal is None

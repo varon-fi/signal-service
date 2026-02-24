@@ -153,6 +153,93 @@ async def test_load_atr_breakout():
 
 
 @pytest.mark.asyncio
+async def test_load_liquidity_sweep_reversal():
+    """Test loading liquidity_sweep_reversal strategy."""
+    rows = [
+        {
+            "id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+            "name": "liquidity_sweep_reversal",
+            "type": "ta_lib",
+            "params": '{"swing_lookback": 20, "volume_multiplier": 1.5}',
+            "symbols": ["BTC", "ETH"],
+            "timeframes": ["5m"],
+            "version": "1.0.0",
+            "mode": "paper",
+            "is_live": True,
+            "status": "active",
+        }
+    ]
+    conn = FakeConn(rows)
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    engine.pool = FakePool(conn)
+
+    await engine._load_strategies()
+
+    assert "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee" in engine.strategies
+    strategy = engine.strategies["eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"]
+    assert strategy.name == "liquidity_sweep_reversal"
+    assert strategy.params["swing_lookback"] == 20
+
+
+@pytest.mark.asyncio
+async def test_load_range_mean_reversion():
+    """Test loading range_mean_reversion strategy."""
+    rows = [
+        {
+            "id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "name": "range_mean_reversion",
+            "type": "ta_lib",
+            "params": '{"vwap_lookback": 20, "rsi_period": 14}',
+            "symbols": ["BTC", "ETH"],
+            "timeframes": ["5m"],
+            "version": "1.0.0",
+            "mode": "paper",
+            "is_live": True,
+            "status": "active",
+        }
+    ]
+    conn = FakeConn(rows)
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    engine.pool = FakePool(conn)
+
+    await engine._load_strategies()
+
+    assert "ffffffff-ffff-ffff-ffff-ffffffffffff" in engine.strategies
+    strategy = engine.strategies["ffffffff-ffff-ffff-ffff-ffffffffffff"]
+    assert strategy.name == "range_mean_reversion"
+    assert strategy.params["vwap_lookback"] == 20
+
+
+@pytest.mark.asyncio
+async def test_load_breakout_retest():
+    """Test loading breakout_retest strategy."""
+    rows = [
+        {
+            "id": "99999999-9999-9999-9999-999999999999",
+            "name": "breakout_retest",
+            "type": "ta_lib",
+            "params": '{"breakout_lookback": 20, "max_retest_bars": 5}',
+            "symbols": ["BTC", "ETH"],
+            "timeframes": ["5m"],
+            "version": "1.0.0",
+            "mode": "paper",
+            "is_live": True,
+            "status": "active",
+        }
+    ]
+    conn = FakeConn(rows)
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    engine.pool = FakePool(conn)
+
+    await engine._load_strategies()
+
+    assert "99999999-9999-9999-9999-999999999999" in engine.strategies
+    strategy = engine.strategies["99999999-9999-9999-9999-999999999999"]
+    assert strategy.name == "breakout_retest"
+    assert strategy.params["breakout_lookback"] == 20
+
+
+@pytest.mark.asyncio
 async def test_load_all_new_strategies():
     """Test loading all 4 new strategies together."""
     rows = [

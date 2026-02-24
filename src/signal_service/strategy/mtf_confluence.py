@@ -110,12 +110,12 @@ class MtfConfluenceStrategy(BaseStrategy):
         # Get current values
         curr_close = candle['close']
         curr_open = candle['open']
-        curr_ltf_ema = ltf_ema.iloc[-1]
+        curr_ltf_ema = ltf_ema[-1] if hasattr(ltf_ema, '__getitem__') else ltf_ema.iloc[-1]
 
         # Get last COMPLETED HTF values (index -2 to avoid partial bar)
-        htf_close = htf_closes.iloc[-2]
-        htf_ema_val = htf_ema.iloc[-2]
-        htf_rsi_val = htf_rsi.iloc[-2]
+        htf_close = htf_closes[-2] if hasattr(htf_closes, '__getitem__') else htf_closes.iloc[-2]
+        htf_ema_val = htf_ema[-2] if hasattr(htf_ema, '__getitem__') else htf_ema.iloc[-2]
+        htf_rsi_val = htf_rsi[-2] if hasattr(htf_rsi, '__getitem__') else htf_rsi.iloc[-2]
 
         if pd.isna(htf_ema_val) or pd.isna(htf_rsi_val) or pd.isna(curr_ltf_ema):
             return None

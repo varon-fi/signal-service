@@ -30,8 +30,8 @@ async def stream_for_timeframe(
     await client.connect()
     try:
         async for ohlc in client.stream_ohlc():
-            signal = await engine.process_candle(ohlc)
-            if signal:
+            signals = await engine.process_candle_signals(ohlc)
+            for signal in signals:
                 await server.emit_signal(signal)
     except asyncio.CancelledError:
         raise

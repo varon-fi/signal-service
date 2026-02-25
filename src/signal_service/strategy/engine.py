@@ -36,6 +36,13 @@ class StrategyEngine:
         self._warmup_complete: dict[str, bool] = {}
         # Track latest candle timestamp seen at startup per symbol/timeframe
         self._startup_latest_ts: dict[str, datetime] = {}
+        # Lightweight instrumentation counters for per-candle evaluation health
+        self._metrics: dict[str, int] = {
+            "candles_processed": 0,
+            "strategies_evaluated": 0,
+            "signals_emitted": 0,
+            "signals_dropped": 0,
+        }
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -315,15 +322,26 @@ class StrategyEngine:
         current_time = candle_ts.time()
         return session_start <= current_time <= session_end
         
-    async def process_candle(self, ohlc: dict) -> Optional[Signal]:
-        """Process an OHLC candle and return signal if generated."""
+    async def process_candle_signals(self, ohlc: dict) -> list[Signal]:
+        """Process an OHLC candle and return all generated signals.
+
+        A single candle can legitimately trigger signals from multiple active
+        strategies. This method evaluates all matching strategies and emits
+        every generated signal in one pass.
+        """
         symbol = ohlc.get('symbol')
         timeframe = ohlc.get('timeframe')
-        
+
+        signals: list[Signal] = []
+        strategies_evaluated = 0
+        signals_emitted = 0
+
         for strategy_id, strategy in self.strategies.items():
             if symbol not in strategy.symbols or timeframe not in strategy.timeframes:
                 continue
-            
+
+            strategies_evaluated += 1
+
             # Normalize candle timestamp
             candle_ts = self._normalize_candle_ts(ohlc.get('timestamp') or ohlc.get('ts'))
 
@@ -367,44 +385,71 @@ class StrategyEngine:
                     logger.info("Strategy warmup complete",
                               strategy=strategy.name, symbol=symbol, timeframe=timeframe,
                               history_bars=len(history))
-            
-            signal = strategy.on_candle(ohlc, history)
-            if signal:
-                signal.strategy_id = strategy_id
-                signal.strategy_version = strategy.version
-                signal.symbol = symbol
-                signal.timeframe = timeframe
 
-                if signal.meta is None:
-                    signal.meta = {}
-                if getattr(strategy, "mode", None):
-                    signal.meta["mode"] = getattr(strategy, "mode")
-                
-                # Persist to database
-                signal_db_id = await self._persist_signal(signal)
-                
-                # Send to ExecutionService if connected
-                if self.execution_client:
-                    try:
-                        trade_signal = self._to_trade_signal(signal, signal_db_id)
-                        await self.execution_client.execute_signal(trade_signal)
-                    except Exception as e:
-                        # Log error but don't fail - signal is already persisted
-                        logger.error(
-                            "Failed to send signal to ExecutionService",
-                            signal_id=signal_db_id or signal.idempotency_key,
-                            correlation_id=signal.correlation_id,
-                            error=str(e),
-                        )
-                
-                logger.info("Signal generated", 
-                          strategy=strategy.name, 
-                          symbol=symbol, 
-                          side=signal.side,
-                          correlation_id=signal.correlation_id)
-                return signal
-                
-        return None
+            signal = strategy.on_candle(ohlc, history)
+            if not signal:
+                continue
+
+            signal.strategy_id = strategy_id
+            signal.strategy_version = strategy.version
+            signal.symbol = symbol
+            signal.timeframe = timeframe
+
+            if signal.meta is None:
+                signal.meta = {}
+            if getattr(strategy, "mode", None):
+                signal.meta["mode"] = getattr(strategy, "mode")
+
+            # Persist to database
+            signal_db_id = await self._persist_signal(signal)
+
+            # Send to ExecutionService if connected
+            if self.execution_client:
+                try:
+                    trade_signal = self._to_trade_signal(signal, signal_db_id)
+                    await self.execution_client.execute_signal(trade_signal)
+                except Exception as e:
+                    # Log error but don't fail - signal is already persisted
+                    logger.error(
+                        "Failed to send signal to ExecutionService",
+                        signal_id=signal_db_id or signal.idempotency_key,
+                        correlation_id=signal.correlation_id,
+                        error=str(e),
+                    )
+
+            logger.info("Signal generated",
+                      strategy=strategy.name,
+                      symbol=symbol,
+                      side=signal.side,
+                      correlation_id=signal.correlation_id)
+            signals.append(signal)
+            signals_emitted += 1
+
+        # Lightweight counters for health telemetry
+        self._metrics["candles_processed"] += 1
+        self._metrics["strategies_evaluated"] += strategies_evaluated
+        self._metrics["signals_emitted"] += signals_emitted
+
+        if strategies_evaluated > 0:
+            logger.debug(
+                "Candle strategy evaluation summary",
+                symbol=symbol,
+                timeframe=timeframe,
+                strategies_evaluated=strategies_evaluated,
+                signals_emitted=signals_emitted,
+                signals_dropped=0,
+            )
+
+        return signals
+
+    async def process_candle(self, ohlc: dict) -> Optional[Signal]:
+        """Backward-compatible wrapper returning the first generated signal."""
+        signals = await self.process_candle_signals(ohlc)
+        return signals[0] if signals else None
+
+    def get_metrics_snapshot(self) -> dict[str, int]:
+        """Return a copy of lightweight processing counters."""
+        return dict(self._metrics)
 
     def _normalize_candle_ts(self, ts) -> Optional[datetime]:
         """Normalize candle timestamp to timezone-aware UTC datetime."""

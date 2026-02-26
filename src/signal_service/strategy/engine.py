@@ -402,6 +402,9 @@ class StrategyEngine:
 
             # Persist to database
             signal_db_id = await self._persist_signal(signal)
+            if signal_db_id:
+                # Keep persisted ID on the in-memory signal for downstream stream emission.
+                signal.signal_db_id = signal_db_id
 
             # Send to ExecutionService if connected
             if self.execution_client:

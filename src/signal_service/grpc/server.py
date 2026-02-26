@@ -93,7 +93,7 @@ class SignalServiceServer:
 
     async def emit_signal(self, signal: Signal):
         """Emit signal to all connected subscribers."""
-        trade_signal = self.engine._to_trade_signal(signal)
+        trade_signal = self.engine._to_trade_signal(signal, getattr(signal, "signal_db_id", None))
         await self._broadcast(trade_signal)
         logger.info(
             "Signal emitted",

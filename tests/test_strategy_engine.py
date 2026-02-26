@@ -120,6 +120,11 @@ async def test_process_candle_signals_emits_all_matching_strategies(monkeypatch)
     assert len(signals) == 3
     assert {s.strategy_id for s in signals} == {"s1", "s2", "s3"}
     assert persisted == [("s1", "long"), ("s2", "short"), ("s3", "long")]
+    assert {s.strategy_id: s.signal_db_id for s in signals} == {
+        "s1": "id-s1",
+        "s2": "id-s2",
+        "s3": "id-s3",
+    }
 
     metrics = engine.get_metrics_snapshot()
     assert metrics["candles_processed"] == 1

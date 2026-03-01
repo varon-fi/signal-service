@@ -1,7 +1,11 @@
 """Strategy engine - loads and executes strategies."""
 
+import hashlib
+import inspect
 import json
+import subprocess
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import asyncpg
@@ -43,6 +47,10 @@ class StrategyEngine:
             "signals_emitted": 0,
             "signals_dropped": 0,
         }
+        # Runtime artifact fingerprints keyed by strategy_id
+        self._strategy_fingerprints: dict[str, dict[str, str]] = {}
+        # Track first-candle fingerprint log emission per strategy/symbol/timeframe
+        self._fingerprint_logged_combos: set[str] = set()
         
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
@@ -63,6 +71,8 @@ class StrategyEngine:
         self.strategies.clear()
         self._warmup_required.clear()
         self._warmup_complete.clear()
+        self._strategy_fingerprints.clear()
+        self._fingerprint_logged_combos.clear()
         await self._load_strategies()
         await self._initialize_startup_state()
         await self._initialize_positions_state()
@@ -96,6 +106,21 @@ class StrategyEngine:
             if strategy:
                 strategy_id = str(row['id'])
                 self.strategies[strategy_id] = strategy
+
+                fingerprint = self._build_strategy_fingerprint(strategy)
+                self._strategy_fingerprints[strategy_id] = fingerprint
+                logger.info(
+                    "Strategy runtime fingerprint",
+                    stage="startup",
+                    strategy_id=strategy_id,
+                    strategy_name=strategy.name,
+                    strategy_version=strategy.version,
+                    module_path=fingerprint["module_path"],
+                    module_sha256=fingerprint["module_sha256"],
+                    git_commit=fingerprint["git_commit"],
+                    params_hash=fingerprint["params_hash"],
+                )
+
                 # Initialize warmup tracking for each strategy/symbol/timeframe combo
                 init_periods = row.get("init_periods") if isinstance(row, dict) else row.get("init_periods")
                 for symbol in strategy.symbols:
@@ -150,6 +175,86 @@ class StrategyEngine:
                 available=list(list_strategies().keys()),
             )
             return None
+
+    def _params_hash(self, params: dict | None) -> str:
+        payload = json.dumps(params or {}, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _file_sha256(self, file_path: str) -> str:
+        if not file_path:
+            return ""
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return ""
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _git_commit_for_path(self, file_path: str) -> str:
+        if not file_path:
+            return ""
+        try:
+            commit = subprocess.check_output(
+                ["git", "-C", str(Path(file_path).parent), "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            return commit.strip()
+        except Exception:
+            return ""
+
+    def _build_strategy_fingerprint(self, strategy: BaseStrategy) -> dict[str, str]:
+        module_path = inspect.getsourcefile(strategy.__class__) or inspect.getfile(strategy.__class__)
+        module_path = str(Path(module_path).resolve()) if module_path else ""
+        params = getattr(strategy, "params", None) or {}
+        return {
+            "strategy_name": str(getattr(strategy, "name", "") or ""),
+            "strategy_version": str(getattr(strategy, "version", "") or ""),
+            "module_path": module_path,
+            "module_sha256": self._file_sha256(module_path),
+            "git_commit": self._git_commit_for_path(module_path),
+            "params_hash": self._params_hash(params),
+        }
+
+    def _emit_first_candle_fingerprint(
+        self,
+        *,
+        strategy_id: str,
+        symbol: str,
+        timeframe: str,
+    ) -> None:
+        combo_key = f"{strategy_id}:{symbol}:{timeframe}"
+        if combo_key in self._fingerprint_logged_combos:
+            return
+
+        fp = self._strategy_fingerprints.get(strategy_id, {})
+        logger.info(
+            "Strategy runtime fingerprint",
+            stage="first_candle",
+            strategy_id=strategy_id,
+            strategy_name=fp.get("strategy_name", ""),
+            strategy_version=fp.get("strategy_version", ""),
+            symbol=symbol,
+            timeframe=timeframe,
+            module_path=fp.get("module_path", ""),
+            module_sha256=fp.get("module_sha256", ""),
+            git_commit=fp.get("git_commit", ""),
+            params_hash=fp.get("params_hash", ""),
+        )
+        self._fingerprint_logged_combos.add(combo_key)
+
+    def _attach_strategy_fingerprint_meta(self, signal: Signal, strategy_id: str) -> None:
+        fp = self._strategy_fingerprints.get(strategy_id, {})
+        if signal.meta is None:
+            signal.meta = {}
+        signal.meta.update(
+            {
+                "strategy_runtime_name": fp.get("strategy_name", ""),
+                "strategy_runtime_version": fp.get("strategy_version", ""),
+                "strategy_artifact_path": fp.get("module_path", ""),
+                "strategy_artifact_hash": fp.get("module_sha256", ""),
+                "strategy_artifact_git_commit": fp.get("git_commit", ""),
+                "strategy_params_hash": fp.get("params_hash", ""),
+            }
+        )
 
     async def _initialize_startup_state(self):
         """Initialize startup gating and warmup state."""
@@ -386,6 +491,12 @@ class StrategyEngine:
                               strategy=strategy.name, symbol=symbol, timeframe=timeframe,
                               history_bars=len(history))
 
+            self._emit_first_candle_fingerprint(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+
             signal = strategy.on_candle(ohlc, history)
             if not signal:
                 continue
@@ -399,6 +510,8 @@ class StrategyEngine:
                 signal.meta = {}
             if getattr(strategy, "mode", None):
                 signal.meta["mode"] = getattr(strategy, "mode")
+
+            self._attach_strategy_fingerprint_meta(signal, strategy_id)
 
             # Persist to database
             signal_db_id = await self._persist_signal(signal)
@@ -453,6 +566,7 @@ class StrategyEngine:
     def get_metrics_snapshot(self) -> dict[str, int]:
         """Return a copy of lightweight processing counters."""
         return dict(self._metrics)
+
 
     def _normalize_candle_ts(self, ts) -> Optional[datetime]:
         """Normalize candle timestamp to timezone-aware UTC datetime."""

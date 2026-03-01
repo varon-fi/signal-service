@@ -1,0 +1,34 @@
+db:
+  url: "postgresql://postgres@localhost:5432/varon_fi"
+session:
+  timezone: "UTC"
+  start: "00:00"
+  end: "23:59"
+data:
+  timeframe: "5m"
+  exchange_id: 1
+  source: "auto"
+  symbols: ["XRP"]
+fees:
+  maker_bps: 2.0
+  taker_bps: 5.0
+  slippage_bps: 2.0
+risk:
+  initial_equity: 10000.0
+  risk_per_trade: 0.005
+  max_leverage: 2.0
+  max_drawdown: 0.20
+strategy:
+  name: "range_mean_reversion"
+  params:
+    vwap_lookback: 20
+    rsi_period: 10
+    rsi_oversold: 30
+    rsi_overbought: 70
+    deviation_pct: 0.9
+    ema_filter_period: 20
+    max_atr_pct: 3.0
+    vwap_tolerance: 0.0015
+    max_hold_candles: 15
+    stop_loss_enabled: true
+    stop_loss_multiplier: 1.5

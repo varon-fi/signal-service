@@ -352,7 +352,12 @@ class StrategyEngine:
                     qty = float(row["quantity"])
                     side = "long" if qty > 0 else "short"
                     entry_price = float(row["avg_entry_price"]) if row["avg_entry_price"] else None
-                    entry_ts = row["entry_ts"]
+                    entry_ts_raw = row["entry_ts"]
+                    entry_ts = (
+                        self._normalize_candle_ts(entry_ts_raw)
+                        if entry_ts_raw is not None
+                        else None
+                    )
 
                     strategy._positions[symbol] = {
                         "side": side,

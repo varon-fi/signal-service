@@ -58,8 +58,8 @@ async def test_load_range_mean_reversion_only():
 
     await engine._load_strategies()
 
-    assert "ffffffff-ffff-ffff-ffff-ffffffffffff:paper" in engine.strategies
-    strategy = engine.strategies["ffffffff-ffff-ffff-ffff-ffffffffffff:paper"]
+    assert "ffffffff-ffff-ffff-ffff-ffffffffffff" in engine.strategies
+    strategy = engine.strategies["ffffffff-ffff-ffff-ffff-ffffffffffff"]
     assert strategy.name == "range_mean_reversion"
     assert strategy.params["vwap_lookback"] == 20
 
@@ -100,4 +100,4 @@ async def test_skip_unsupported_strategy_names():
     await engine._load_strategies()
 
     loaded_ids = set(engine.strategies.keys())
-    assert loaded_ids == {"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:paper"}
+    assert loaded_ids == {"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}

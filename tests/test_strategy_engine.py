@@ -79,9 +79,10 @@ async def test_load_strategies_from_db():
 
     await engine._load_strategies()
 
-    assert "11111111-1111-1111-1111-111111111111:live" in engine.strategies
+    assert "11111111-1111-1111-1111-111111111111" in engine.strategies
     assert conn.last_args == ()
     assert "status = 'active'" in conn.last_query
+    assert "sc.mode" not in conn.last_query
 
 
 class DummyStrategy:
@@ -91,7 +92,6 @@ class DummyStrategy:
         self.symbols = ["BTC"]
         self.timeframes = ["5m"]
         self.params = {}
-        self.mode = "paper"
         self._side = side
 
     def on_candle(self, _ohlc, _history):
@@ -105,7 +105,6 @@ class DummyStateStrategy:
         self.symbols = ["BTC"]
         self.timeframes = ["5m"]
         self.params = {}
-        self.mode = "paper"
         self._positions = {}
 
 
@@ -226,9 +225,10 @@ async def test_initialize_positions_state_normalizes_naive_entry_ts():
     naive_entry_ts = datetime(2026, 3, 1, 12, 0, 0)  # naive datetime
     conn = PositionFakeConn(
         {
-            "quantity": 1.0,
-            "avg_entry_price": 50000.0,
-            "entry_ts": naive_entry_ts,
+            "signal_type": "LONG",
+            "signal_value": 50000.0,
+            "ts": naive_entry_ts,
+            "payload": {"deviation_pct": "0.75"},
         }
     )
     engine = StrategyEngine("postgresql://localhost/varon_fi")
@@ -238,5 +238,7 @@ async def test_initialize_positions_state_normalizes_naive_entry_ts():
     await engine._initialize_positions_state()
 
     entry_ts = engine.strategies["s1"]._positions["BTC"]["entry_ts"]
+    entry_deviation = engine.strategies["s1"]._positions["BTC"]["entry_deviation"]
     assert entry_ts.tzinfo is not None
     assert entry_ts.utcoffset() == timezone.utc.utcoffset(entry_ts)
+    assert entry_deviation == 0.75

@@ -19,7 +19,7 @@ from structlog import get_logger
 import signal_service.strategy  # registers supported strategies
 from signal_service.grpc.execution_client import ExecutionServiceClient
 from varon_fi import BaseStrategy, Signal, StrategyConfig, create_strategy, list_strategies
-from varon_fi.proto.varon_fi_pb2 import TraceContext, TradeSignal, TradingMode
+from varon_fi.proto.varon_fi_pb2 import TraceContext, TradeSignal
 
 logger = get_logger(__name__)
 
@@ -649,8 +649,6 @@ class StrategyEngine:
             side=signal.side,
             price=signal.price or 0.0,
             confidence=signal.confidence,
-            # Compatibility placeholder; signal-service treats mode as execution concern.
-            mode=TradingMode.PAPER,
             meta={str(k): "" if v is None else str(v) for k, v in meta.items()},
             trace=trace,
         )
@@ -719,9 +717,9 @@ class StrategyEngine:
                 """
                 INSERT INTO signals
                 (exchange_id, instrument_id, strategy_id, strategy_version,
-                 signal_type, signal_value, confidence, payload, mode,
+                 signal_type, signal_value, confidence, payload,
                  idempotency_key, correlation_id)
-                VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING id
                 """,
                 instrument_id,
@@ -731,8 +729,6 @@ class StrategyEngine:
                 signal_value,
                 signal.confidence,
                 json.dumps(signal.meta),
-                # Compatibility placeholder; canonical signal generation is mode-agnostic.
-                "paper",
                 signal.idempotency_key,
                 signal.correlation_id,
             )

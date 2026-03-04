@@ -20,6 +20,11 @@ class FakeConn:
         self.last_args = args
         return self.rows
 
+    async def fetchrow(self, query, *args):
+        self.last_query = query
+        self.last_args = args
+        return None
+
 
 class FakeAcquire:
     def __init__(self, conn):
@@ -40,14 +45,26 @@ class FakePool:
         return FakeAcquire(self.conn)
 
 
+class PositionFakeConn:
+    def __init__(self, row):
+        self.row = row
+        self.last_query = None
+        self.last_args = None
+
+    async def fetchrow(self, query, *args):
+        self.last_query = query
+        self.last_args = args
+        return self.row
+
+
 @pytest.mark.asyncio
 async def test_load_strategies_from_db():
     rows = [
         {
             "id": "11111111-1111-1111-1111-111111111111",
-            "name": "mtf_confluence",
+            "name": "range_mean_reversion",
             "type": "ta_lib",
-            "params": {"htf_ema_len": 50},
+            "params": {"vwap_lookback": 20},
             "symbols": ["BTC"],
             "timeframes": ["5m"],
             "version": "1.0.0",
@@ -62,7 +79,7 @@ async def test_load_strategies_from_db():
 
     await engine._load_strategies()
 
-    assert "11111111-1111-1111-1111-111111111111" in engine.strategies
+    assert "11111111-1111-1111-1111-111111111111:live" in engine.strategies
     assert conn.last_args == ()
     assert "status = 'active'" in conn.last_query
 
@@ -79,6 +96,17 @@ class DummyStrategy:
 
     def on_candle(self, _ohlc, _history):
         return Signal(side=self._side, price=50000.0, confidence=0.6)
+
+
+class DummyStateStrategy:
+    def __init__(self):
+        self.name = "range_mean_reversion"
+        self.version = "1.1.0"
+        self.symbols = ["BTC"]
+        self.timeframes = ["5m"]
+        self.params = {}
+        self.mode = "paper"
+        self._positions = {}
 
 
 @pytest.mark.asyncio
@@ -191,3 +219,24 @@ async def test_process_candle_wrapper_keeps_backward_compat(monkeypatch):
     signal = await engine.process_candle({"symbol": "BTC", "timeframe": "5m"})
     assert signal is not None
     assert signal.side == "long"
+
+
+@pytest.mark.asyncio
+async def test_initialize_positions_state_normalizes_naive_entry_ts():
+    naive_entry_ts = datetime(2026, 3, 1, 12, 0, 0)  # naive datetime
+    conn = PositionFakeConn(
+        {
+            "quantity": 1.0,
+            "avg_entry_price": 50000.0,
+            "entry_ts": naive_entry_ts,
+        }
+    )
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    engine.pool = FakePool(conn)
+    engine.strategies = {"s1": DummyStateStrategy()}
+
+    await engine._initialize_positions_state()
+
+    entry_ts = engine.strategies["s1"]._positions["BTC"]["entry_ts"]
+    assert entry_ts.tzinfo is not None
+    assert entry_ts.utcoffset() == timezone.utc.utcoffset(entry_ts)

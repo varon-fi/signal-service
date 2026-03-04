@@ -1,50 +1,50 @@
 # Signal Service
 
-Real-time trading signal generation service for varon.fi platform.
+Real-time trading signal generation service for varon.fi.
 
 ## Responsibilities
 - Consume OHLC market data via gRPC DataService streaming
-- Load live strategies from database
-- Generate buy/sell signals using TA-Lib indicators
-- Emit TradeSignal events via gRPC SignalService
-- Persist signal history to Postgres
+- Load active strategies from Postgres
+- Generate trading signals and emit `TradeSignal` events via gRPC
+- Persist signals to Postgres
+- Forward signals to Execution Service
+
+## Active Strategy Surface
+
+`signal-service` now supports only:
+- `range_mean_reversion`
+
+Legacy strategy families were removed from this service to keep runtime parity with shared strategy logic and reduce drift.
+
+## Data Source
+
+Signal history and warmup reads use canonical `ohlcs` only.
+Legacy `ohlc_imports` fallback paths were removed.
 
 ## Architecture
 
+```text
+[DataService] -> gRPC OHLC stream -> [Signal Service] -> gRPC TradeSignal -> [Orders Service]
+                     ^                                              |
+                     |                                              v
+                Postgres (ohlcs)                             Postgres (signals)
 ```
-[DataService] → gRPC OHLC stream → [Signal Service] → gRPC TradeSignal → [Orders Service]
-                     ↑                                              ↓
-              Postgres (market data)                          Postgres (signals)
-                     ↑
-            Config from DB (strategies table)
-```
-
-## Tech Stack
-- Python 3.12+
-- gRPC + protobuf
-- PostgreSQL (asyncpg)
-- TA-Lib (via python wrapper)
-- pytest for testing
 
 ## Quick Start
 
 ```bash
-# Install dependencies
 pip install -e .
-
-# Run tests
 pytest -q
-
-# Start service
 python -m signal_service.main
 ```
 
 ## Environment Variables
-- `DATABASE_URL` — Postgres connection string
-- `DATASERVICE_GRPC_ADDR` — DataService gRPC endpoint (default: localhost:50051)
-- `SIGNALSERVICE_GRPC_PORT` — Port to expose SignalService (default: 50052)
-- Strategy mode is per‑strategy in DB (`strategies.mode`); Signal Service runs all active strategies.
+- `DATABASE_URL`: Postgres connection string
+- `DATASERVICE_GRPC_ADDR`: DataService gRPC endpoint (default `localhost:50051`)
+- `SIGNALSERVICE_GRPC_PORT`: SignalService gRPC port (default `50052`)
+- `EXECUTIONSERVICE_GRPC_ADDR`: ExecutionService gRPC endpoint (default `localhost:50053`)
 
 ## Strategy Loading
-- Strategies are loaded from Postgres on startup (filtered by mode + active flags).
-- To apply strategy config changes, restart the service (no hot-reload wired yet).
+- Strategies are loaded from Postgres at startup (`status='active'`).
+- Unsupported strategy names are skipped.
+- Restart service to apply strategy config changes.

@@ -1,14 +1,6 @@
 """Strategy package.
 
-Importing this package registers built-in strategies with varon_fi.
+Importing this package registers the supported strategy set with varon_fi.
 """
 
-from signal_service.strategy import mtf_confluence  # noqa: F401
-from signal_service.strategy import volatility_expansion  # noqa: F401
-from signal_service.strategy import volume_range_breakout  # noqa: F401
-from signal_service.strategy import momentum  # noqa: F401
-from signal_service.strategy import atr_breakout  # noqa: F401
-from signal_service.strategy import low_vol_momentum  # noqa: F401
-from signal_service.strategy import liquidity_sweep_reversal  # noqa: F401
 from signal_service.strategy import range_mean_reversion  # noqa: F401
-from signal_service.strategy import breakout_retest  # noqa: F401

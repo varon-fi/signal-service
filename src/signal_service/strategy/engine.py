@@ -1,29 +1,34 @@
 """Strategy engine - loads and executes strategies."""
 
+from __future__ import annotations
+
 import hashlib
 import inspect
 import json
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import asyncpg
 import pandas as pd
-from structlog import get_logger
 from google.protobuf.timestamp_pb2 import Timestamp
-from datetime import datetime, timezone
+from structlog import get_logger
 
-import signal_service.strategy  # registers built-in strategies
-from varon_fi import BaseStrategy, Signal, StrategyConfig, create_strategy, list_strategies
+import signal_service.strategy  # registers supported strategies
 from signal_service.grpc.execution_client import ExecutionServiceClient
-from varon_fi.proto.varon_fi_pb2 import TradeSignal, TradingMode, TraceContext
+from varon_fi import BaseStrategy, Signal, StrategyConfig, create_strategy, list_strategies
+from varon_fi.proto.varon_fi_pb2 import TraceContext, TradeSignal, TradingMode
+
 logger = get_logger(__name__)
+
+SUPPORTED_STRATEGY_NAMES = {"range_mean_reversion"}
 
 
 class StrategyEngine:
     """Manages live strategies and generates signals."""
-    
+
     def __init__(
         self,
         database_url: str,
@@ -33,31 +38,31 @@ class StrategyEngine:
         self.pool: Optional[asyncpg.Pool] = None
         self.strategies: dict[str, BaseStrategy] = {}
         self.execution_client = execution_client
-        # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals
+        # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals.
         self._last_candle_ts: dict[str, datetime] = {}
-        # Track warmup requirements per strategy/symbol/timeframe
+        # Track warmup requirements per strategy/symbol/timeframe.
         self._warmup_required: dict[str, int] = {}
         self._warmup_complete: dict[str, bool] = {}
-        # Track latest candle timestamp seen at startup per symbol/timeframe
+        # Track latest candle timestamp seen at startup per symbol/timeframe.
         self._startup_latest_ts: dict[str, datetime] = {}
-        # Lightweight instrumentation counters for per-candle evaluation health
+        # Lightweight instrumentation counters for per-candle evaluation health.
         self._metrics: dict[str, int] = {
             "candles_processed": 0,
             "strategies_evaluated": 0,
             "signals_emitted": 0,
             "signals_dropped": 0,
         }
-        # Runtime artifact fingerprints keyed by strategy_id
+        # Runtime artifact fingerprints keyed by strategy_id.
         self._strategy_fingerprints: dict[str, dict[str, str]] = {}
-        # Track first-candle fingerprint log emission per strategy/symbol/timeframe
+        # Track first-candle fingerprint log emission per strategy/symbol/timeframe.
         self._fingerprint_logged_combos: set[str] = set()
-        
+
     async def connect_execution_service(self, addr: str):
         """Connect to ExecutionService for signal forwarding."""
         self.execution_client = ExecutionServiceClient(addr)
         await self.execution_client.connect()
         logger.info("ExecutionService client connected", addr=addr)
-        
+
     async def initialize(self):
         """Initialize DB connection and load active strategies."""
         self.pool = await asyncpg.create_pool(self.database_url)
@@ -79,11 +84,7 @@ class StrategyEngine:
         logger.info("Strategies reloaded", strategy_count=len(self.strategies))
 
     def get_required_subscriptions(self) -> dict[str, list[str]]:
-        """Get all symbol/timeframe combinations required by active strategies.
-
-        Returns:
-            Dict mapping timeframe -> list of symbols
-        """
+        """Get all symbol/timeframe combinations required by active strategies."""
         subscriptions: dict[str, set[str]] = {}
         for strategy in self.strategies.values():
             for timeframe in strategy.timeframes:
@@ -91,55 +92,81 @@ class StrategyEngine:
                     subscriptions[timeframe] = set()
                 subscriptions[timeframe].update(strategy.symbols)
         return {tf: list(symbols) for tf, symbols in subscriptions.items()}
-        
+
     async def _load_strategies(self):
         """Load all active strategies from database."""
+        assert self.pool is not None
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT *
-                FROM strategies
-                WHERE status = 'active'
-            """)
-            
+            rows = await conn.fetch(
+                """
+                SELECT
+                    s.id,
+                    s.name,
+                    s.version,
+                    s.params,
+                    s.init_periods,
+                    s.status,
+                    sc.mode,
+                    ARRAY_AGG(DISTINCT sc.symbol ORDER BY sc.symbol) AS symbols,
+                    ARRAY_AGG(DISTINCT sc.timeframe ORDER BY sc.timeframe) AS timeframes
+                FROM strategies s
+                JOIN strategy_configs sc
+                  ON sc.strategy_id = s.id
+                WHERE s.status = 'active'
+                  AND sc.enabled = TRUE
+                GROUP BY s.id, s.name, s.version, s.params, s.init_periods, s.status, sc.mode
+                """
+            )
+
         for row in rows:
             strategy = self._create_strategy(row)
-            if strategy:
-                strategy_id = str(row['id'])
-                self.strategies[strategy_id] = strategy
+            if strategy is None:
+                continue
 
-                fingerprint = self._build_strategy_fingerprint(strategy)
-                self._strategy_fingerprints[strategy_id] = fingerprint
-                logger.info(
-                    "Strategy runtime fingerprint",
-                    stage="startup",
-                    strategy_id=strategy_id,
-                    strategy_name=strategy.name,
-                    strategy_version=strategy.version,
-                    module_path=fingerprint["module_path"],
-                    module_sha256=fingerprint["module_sha256"],
-                    git_commit=fingerprint["git_commit"],
-                    params_hash=fingerprint["params_hash"],
-                )
+            strategy_id = str(row["id"])
+            strategy_mode = str(row["mode"]) if row.get("mode") else "paper"
+            strategy_key = f"{strategy_id}:{strategy_mode}"
+            self.strategies[strategy_key] = strategy
 
-                # Initialize warmup tracking for each strategy/symbol/timeframe combo
-                init_periods = row.get("init_periods") if isinstance(row, dict) else row.get("init_periods")
-                for symbol in strategy.symbols:
-                    for timeframe in strategy.timeframes:
-                        warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
-                        required = int(init_periods) if init_periods else 0
-                        self._warmup_required[warmup_key] = required
-                        self._warmup_complete[warmup_key] = (required == 0)
-                        logger.info("Strategy warmup initialized",
-                                  strategy=strategy.name,
-                                  symbol=symbol,
-                                  timeframe=timeframe,
-                                  min_bars=required)
-                
+            fingerprint = self._build_strategy_fingerprint(strategy)
+            self._strategy_fingerprints[strategy_key] = fingerprint
+            logger.info(
+                "Strategy runtime fingerprint",
+                stage="startup",
+                strategy_id=strategy_id,
+                mode=strategy_mode,
+                strategy_name=strategy.name,
+                strategy_version=strategy.version,
+                module_path=fingerprint["module_path"],
+                module_sha256=fingerprint["module_sha256"],
+                git_commit=fingerprint["git_commit"],
+                params_hash=fingerprint["params_hash"],
+            )
+
+            init_periods = row.get("init_periods") if isinstance(row, dict) else row.get("init_periods")
+            for symbol in strategy.symbols:
+                for timeframe in strategy.timeframes:
+                    warmup_key = f"{strategy_key}:{symbol}:{timeframe}"
+                    required = int(init_periods) if init_periods else 0
+                    self._warmup_required[warmup_key] = required
+                    self._warmup_complete[warmup_key] = required == 0
+                    logger.info(
+                        "Strategy warmup initialized",
+                        strategy=strategy.name,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        min_bars=required,
+                    )
+
     def _create_strategy(self, row: asyncpg.Record) -> Optional[BaseStrategy]:
         """Instantiate a strategy from DB row."""
         name = row.get("name") if isinstance(row, dict) else row["name"]
         if not name:
             logger.warning("Strategy missing name", row=row)
+            return None
+
+        if name not in SUPPORTED_STRATEGY_NAMES:
+            logger.info("Skipping unsupported strategy", name=name)
             return None
 
         raw_params = row.get("params") if isinstance(row, dict) else row["params"]
@@ -258,17 +285,15 @@ class StrategyEngine:
 
     async def _initialize_startup_state(self):
         """Initialize startup gating and warmup state."""
-        if not self.strategies:
+        if not self.strategies or self.pool is None:
             return
 
-        # Build unique symbol/timeframe combinations across strategies
         combos: set[tuple[str, str]] = set()
         for strategy in self.strategies.values():
             for symbol in strategy.symbols:
                 for timeframe in strategy.timeframes:
                     combos.add((symbol, timeframe))
 
-        # Record latest candle timestamp at startup per symbol/timeframe
         async with self.pool.acquire() as conn:
             for symbol, timeframe in combos:
                 row = await conn.fetchrow(
@@ -278,14 +303,13 @@ class StrategyEngine:
                     JOIN instruments i ON o.instrument_id = i.id
                     WHERE i.symbol = $1 AND o.timeframe = $2
                     """,
-                    symbol, timeframe
+                    symbol,
+                    timeframe,
                 )
                 if row and row["ts"]:
                     self._startup_latest_ts[f"{symbol}:{timeframe}"] = row["ts"]
 
-        # Prime warmup state by fetching historical bars
         for strategy_id, strategy in self.strategies.items():
-            history_source = (strategy.params or {}).get("history_source", "auto")
             lookback_days = (strategy.params or {}).get("lookback_days")
             for symbol in strategy.symbols:
                 for timeframe in strategy.timeframes:
@@ -293,84 +317,82 @@ class StrategyEngine:
                     required = self._warmup_required.get(warmup_key, 0)
                     lookback_bars = self._calc_lookback_bars(timeframe, lookback_days)
                     bars_needed = max(required, lookback_bars) if lookback_bars else required
-                    if bars_needed > 0:
-                        history = await self._fetch_history(
-                            symbol, timeframe, bars=bars_needed, source=history_source
+                    if bars_needed <= 0:
+                        continue
+                    history = await self._fetch_history(symbol, timeframe, bars=bars_needed)
+                    if len(history) >= required:
+                        self._warmup_complete[warmup_key] = True
+                        logger.info(
+                            "Strategy warmup complete",
+                            strategy=strategy.name,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            history_bars=len(history),
                         )
-                        if len(history) >= required:
-                            self._warmup_complete[warmup_key] = True
-                            logger.info("Strategy warmup complete",
-                                        strategy=strategy.name,
-                                        symbol=symbol,
-                                        timeframe=timeframe,
-                                        history_bars=len(history))
-                        else:
-                            self._warmup_complete[warmup_key] = False
-                            logger.info("Strategy warmup pending",
-                                        strategy=strategy.name,
-                                        symbol=symbol,
-                                        timeframe=timeframe,
-                                        history_bars=len(history),
-                                        required_bars=required)
+                    else:
+                        self._warmup_complete[warmup_key] = False
+                        logger.info(
+                            "Strategy warmup pending",
+                            strategy=strategy.name,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            history_bars=len(history),
+                            required_bars=required,
+                        )
 
     async def _initialize_positions_state(self):
-        """Hydrate in-memory strategy positions from DB (for exit logic)."""
+        """Hydrate in-memory strategy positions from DB when strategies track state."""
         if not self.strategies or not self.pool:
             return
 
         async with self.pool.acquire() as conn:
-            for strategy_id, strategy in self.strategies.items():
-                if getattr(strategy, "name", "") != "low_vol_momentum":
-                    continue
+            for strategy_key, strategy in self.strategies.items():
                 if not hasattr(strategy, "_positions"):
                     continue
+
+                strategy_id = str(getattr(strategy, "strategy_id", "") or strategy_key.split(":", 1)[0])
+                mode = str(getattr(strategy, "mode", "paper") or "paper")
                 for symbol in strategy.symbols:
                     row = await conn.fetchrow(
                         """
-                        SELECT quantity, avg_entry_price, entry_ts, entry_regime
+                        SELECT quantity, avg_entry_price, entry_ts
                         FROM positions
-                        WHERE strategy_id = $1 AND symbol = $2
+                        WHERE strategy_id = $1 AND symbol = $2 AND mode = $3
                         """,
-                        strategy_id, symbol
+                        strategy_id,
+                        symbol,
+                        mode,
                     )
                     if not row or row["quantity"] is None or float(row["quantity"]) == 0:
                         continue
 
                     qty = float(row["quantity"])
-                    entry_price = float(row["avg_entry_price"]) if row["avg_entry_price"] else None
-                    entry_ts = row["entry_ts"]
-                    entry_regime = row["entry_regime"]
-
-                    # Fallback: derive entry_ts/entry_regime from latest filled order
-                    if entry_ts is None:
-                        order_row = await conn.fetchrow(
-                            """
-                            SELECT filled_at, meta->>'regime' AS regime
-                            FROM orders
-                            WHERE strategy_id = $1 AND symbol = $2 AND status = 'filled'
-                            ORDER BY filled_at DESC
-                            LIMIT 1
-                            """,
-                            strategy_id, symbol
-                        )
-                        if order_row:
-                            entry_ts = order_row["filled_at"]
-                            entry_regime = entry_regime or order_row["regime"]
-
                     side = "long" if qty > 0 else "short"
+                    entry_price = float(row["avg_entry_price"]) if row["avg_entry_price"] else None
+                    entry_ts_raw = row["entry_ts"]
+                    entry_ts = (
+                        self._normalize_candle_ts(entry_ts_raw)
+                        if entry_ts_raw is not None
+                        else None
+                    )
+
                     strategy._positions[symbol] = {
                         "side": side,
                         "entry_price": entry_price,
                         "entry_ts": entry_ts,
-                        "entry_regime": entry_regime or "unknown",
+                        # No reliable historical entry deviation in positions table.
+                        "entry_deviation": 0.0,
                     }
-                    logger.info("Hydrated position state",
-                                strategy=strategy.name,
-                                symbol=symbol,
-                                side=side,
-                                entry_price=entry_price,
-                                entry_ts=entry_ts,
-                                entry_regime=entry_regime)
+                    logger.info(
+                        "Hydrated position state",
+                        strategy=strategy.name,
+                        strategy_id=strategy_id,
+                        symbol=symbol,
+                        mode=mode,
+                        side=side,
+                        entry_price=entry_price,
+                        entry_ts=entry_ts,
+                    )
 
     def _calc_lookback_bars(self, timeframe: str, lookback_days: Optional[int]) -> int:
         """Convert lookback_days into number of bars for a timeframe."""
@@ -404,21 +426,18 @@ class StrategyEngine:
         if candle_ts is None:
             return True
 
-        # Strategy-provided helper
         if hasattr(strategy, "_in_session") and callable(getattr(strategy, "_in_session")):
             try:
                 return bool(strategy._in_session(candle_ts))
             except Exception:
                 return True
 
-        # Fallback to params or attributes
         params = getattr(strategy, "params", None) or {}
         session_start = params.get("session_start") or getattr(strategy, "session_start", None)
         session_end = params.get("session_end") or getattr(strategy, "session_end", None)
         if not session_start or not session_end:
             return True
 
-        # Parse session times if given as strings ("HH:MM")
         if isinstance(session_start, str):
             session_start = datetime.strptime(session_start, "%H:%M").time()
         if isinstance(session_end, str):
@@ -426,73 +445,70 @@ class StrategyEngine:
 
         current_time = candle_ts.time()
         return session_start <= current_time <= session_end
-        
-    async def process_candle_signals(self, ohlc: dict) -> list[Signal]:
-        """Process an OHLC candle and return all generated signals.
 
-        A single candle can legitimately trigger signals from multiple active
-        strategies. This method evaluates all matching strategies and emits
-        every generated signal in one pass.
-        """
-        symbol = ohlc.get('symbol')
-        timeframe = ohlc.get('timeframe')
+    async def process_candle_signals(self, ohlc: dict) -> list[Signal]:
+        """Process an OHLC candle and return all generated signals."""
+        symbol = ohlc.get("symbol")
+        timeframe = ohlc.get("timeframe")
 
         signals: list[Signal] = []
         strategies_evaluated = 0
         signals_emitted = 0
 
-        for strategy_id, strategy in self.strategies.items():
+        for strategy_key, strategy in self.strategies.items():
             if symbol not in strategy.symbols or timeframe not in strategy.timeframes:
                 continue
 
             strategies_evaluated += 1
+            strategy_id = str(getattr(strategy, "strategy_id", "") or strategy_key.split(":", 1)[0])
 
-            # Normalize candle timestamp
-            candle_ts = self._normalize_candle_ts(ohlc.get('timestamp') or ohlc.get('ts'))
+            candle_ts = self._normalize_candle_ts(ohlc.get("timestamp") or ohlc.get("ts"))
 
-            # Per-strategy session window enforcement (requirement #1)
             if not self._in_strategy_session(strategy, candle_ts):
                 continue
 
-            # Live-candle gating: skip candles at or before startup latest ts (requirement #3)
             if candle_ts is not None:
                 startup_key = f"{symbol}:{timeframe}"
                 startup_ts = self._startup_latest_ts.get(startup_key)
                 if startup_ts is not None and candle_ts <= startup_ts:
                     continue
 
-            # De-duplicate per candle: only process each candle once per strategy/symbol/timeframe
             if candle_ts is not None:
-                dedupe_key = f"{strategy_id}:{symbol}:{timeframe}"
+                dedupe_key = f"{strategy_key}:{symbol}:{timeframe}"
                 last_ts = self._last_candle_ts.get(dedupe_key)
                 if last_ts is not None and candle_ts <= last_ts:
                     continue
                 self._last_candle_ts[dedupe_key] = candle_ts
 
-            # Fetch recent history for this symbol/timeframe
-            warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+            warmup_key = f"{strategy_key}:{symbol}:{timeframe}"
             required = self._warmup_required.get(warmup_key, 0)
-            history_source = (strategy.params or {}).get("history_source", "auto")
             lookback_days = (strategy.params or {}).get("lookback_days")
             lookback_bars = self._calc_lookback_bars(timeframe, lookback_days)
             bars_needed = max(200, required, lookback_bars) if lookback_bars else max(200, required)
-            history = await self._fetch_history(symbol, timeframe, bars=bars_needed, source=history_source)
+            history = await self._fetch_history(symbol, timeframe, bars=bars_needed)
 
-            # Warmup check (requirement #2)
             if required > 0 and not self._warmup_complete.get(warmup_key, True):
                 if len(history) < required:
-                    logger.debug("Skipping signal - warmup in progress",
-                               strategy=strategy.name, symbol=symbol, timeframe=timeframe,
-                               history_bars=len(history), required_bars=required)
+                    logger.debug(
+                        "Skipping signal - warmup in progress",
+                        strategy=strategy.name,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        history_bars=len(history),
+                        required_bars=required,
+                    )
                     continue
-                else:
-                    self._warmup_complete[warmup_key] = True
-                    logger.info("Strategy warmup complete",
-                              strategy=strategy.name, symbol=symbol, timeframe=timeframe,
-                              history_bars=len(history))
+                self._warmup_complete[warmup_key] = True
+                logger.info(
+                    "Strategy warmup complete",
+                    strategy=strategy.name,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    history_bars=len(history),
+                )
 
             self._emit_first_candle_fingerprint(
-                strategy_id=strategy_id,
+                strategy_id=strategy_key,
                 symbol=symbol,
                 timeframe=timeframe,
             )
@@ -511,21 +527,17 @@ class StrategyEngine:
             if getattr(strategy, "mode", None):
                 signal.meta["mode"] = getattr(strategy, "mode")
 
-            self._attach_strategy_fingerprint_meta(signal, strategy_id)
+            self._attach_strategy_fingerprint_meta(signal, strategy_key)
 
-            # Persist to database
             signal_db_id = await self._persist_signal(signal)
             if signal_db_id:
-                # Keep persisted ID on the in-memory signal for downstream stream emission.
                 signal.signal_db_id = signal_db_id
 
-            # Send to ExecutionService if connected
             if self.execution_client:
                 try:
                     trade_signal = self._to_trade_signal(signal, signal_db_id)
                     await self.execution_client.execute_signal(trade_signal)
                 except Exception as e:
-                    # Log error but don't fail - signal is already persisted
                     logger.error(
                         "Failed to send signal to ExecutionService",
                         signal_id=signal_db_id or signal.idempotency_key,
@@ -533,15 +545,16 @@ class StrategyEngine:
                         error=str(e),
                     )
 
-            logger.info("Signal generated",
-                      strategy=strategy.name,
-                      symbol=symbol,
-                      side=signal.side,
-                      correlation_id=signal.correlation_id)
+            logger.info(
+                "Signal generated",
+                strategy=strategy.name,
+                symbol=symbol,
+                side=signal.side,
+                correlation_id=signal.correlation_id,
+            )
             signals.append(signal)
             signals_emitted += 1
 
-        # Lightweight counters for health telemetry
         self._metrics["candles_processed"] += 1
         self._metrics["strategies_evaluated"] += strategies_evaluated
         self._metrics["signals_emitted"] += signals_emitted
@@ -567,58 +580,50 @@ class StrategyEngine:
         """Return a copy of lightweight processing counters."""
         return dict(self._metrics)
 
-
     def _normalize_candle_ts(self, ts) -> Optional[datetime]:
         """Normalize candle timestamp to timezone-aware UTC datetime."""
         if ts is None:
             return None
 
-        # Handle different timestamp types
         if isinstance(ts, (int, float)):
             dt = datetime.fromtimestamp(ts, timezone.utc)
         elif isinstance(ts, datetime):
             dt = ts
-        elif hasattr(ts, 'seconds') and hasattr(ts, 'nanos'):
+        elif hasattr(ts, "seconds") and hasattr(ts, "nanos"):
             dt = datetime.fromtimestamp(ts.seconds, timezone.utc)
         elif isinstance(ts, str):
             dt = pd.to_datetime(ts)
-        elif hasattr(ts, 'ToDatetime'):
+        elif hasattr(ts, "ToDatetime"):
             dt = ts.ToDatetime(tzinfo=timezone.utc)
         else:
             return None
 
-        # Convert pandas Timestamp to datetime if needed
         if isinstance(dt, pd.Timestamp):
             dt = dt.to_pydatetime()
 
-        # Ensure UTC timezone
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         else:
             dt = dt.astimezone(timezone.utc)
 
         return dt
-        
+
     def _to_trade_signal(self, signal: Signal, signal_db_id: Optional[str] = None) -> TradeSignal:
-        """Convert internal Signal to TradeSignal protobuf matching PR#7 proto."""
+        """Convert internal Signal to TradeSignal protobuf."""
         now = datetime.now(timezone.utc)
         timestamp = Timestamp()
         timestamp.FromDatetime(now)
 
-        # Normalize meta to dict (handles string/JSON edge cases)
         meta = self._normalize_meta(signal.meta)
 
-        # Convert mode string to TradingMode enum
-        mode_str = meta.get("mode") or "paper"
-        mode_str = str(mode_str).lower()
+        mode_str = str(meta.get("mode") or "paper").lower()
         mode = TradingMode.LIVE if mode_str == "live" else TradingMode.PAPER
 
-        # Build TraceContext with correlation and idempotency keys
         trace = TraceContext(
             correlation_id=signal.correlation_id if signal.correlation_id else str(uuid.uuid4()),
             idempotency_key=signal.idempotency_key if signal.idempotency_key else str(uuid.uuid4()),
             source_service="signal-service",
-            latency_ms=0,  # TODO: Track actual latency
+            latency_ms=0,
             timestamp=timestamp,
         )
 
@@ -637,13 +642,7 @@ class StrategyEngine:
         )
 
     def _normalize_meta(self, meta_value) -> dict:
-        """Normalize meta field to Python dict.
-
-        Handles multiple formats:
-        - Already a dict (normal case)
-        - JSON string (deserialization edge cases)
-        - None (returns empty dict)
-        """
+        """Normalize meta field to Python dict."""
         if meta_value is None:
             return {}
         if isinstance(meta_value, dict):
@@ -656,112 +655,75 @@ class StrategyEngine:
                 return {}
         logger.warning(f"Unexpected meta type {type(meta_value)}, using empty dict")
         return {}
-        
-    async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200, source: str = "ohlcs") -> pd.DataFrame:
-        """Fetch recent OHLC history from database for symbol and timeframe.
 
-        Args:
-            source: "ohlcs" (default), "imported", or "auto" (prefer ohlcs, fallback to imports if insufficient)
-        """
+    async def _fetch_history(self, symbol: str, timeframe: str, bars: int = 200) -> pd.DataFrame:
+        """Fetch recent OHLC history from canonical ohlcs table."""
         bars = int(bars or 0)
         if bars <= 0:
             bars = 1
 
-        source = (source or "ohlcs").lower()
-
+        assert self.pool is not None
         async with self.pool.acquire() as conn:
-            if source == "auto":
-                ohlcs_rows = await conn.fetch("""
-                    SELECT ts as timestamp, open, high, low, close, volume
-                    FROM ohlcs o
-                    JOIN instruments i ON o.instrument_id = i.id
-                    WHERE i.symbol = $1 AND o.timeframe = $2
-                    ORDER BY ts DESC
-                    LIMIT $3
-                """, symbol, timeframe, bars)
+            rows = await conn.fetch(
+                """
+                SELECT ts as timestamp, open, high, low, close, volume
+                FROM ohlcs o
+                JOIN instruments i ON o.instrument_id = i.id
+                WHERE i.symbol = $1 AND o.timeframe = $2
+                ORDER BY ts DESC
+                LIMIT $3
+                """,
+                symbol,
+                timeframe,
+                bars,
+            )
 
-                if len(ohlcs_rows) >= bars:
-                    rows = ohlcs_rows
-                else:
-                    imported_rows = await conn.fetch("""
-                        SELECT ts as timestamp, open, high, low, close, volume
-                        FROM ohlc_imports o
-                        JOIN instruments i ON o.instrument_id = i.id
-                        WHERE i.symbol = $1 AND o.timeframe = $2
-                        ORDER BY ts DESC
-                        LIMIT $3
-                    """, symbol, timeframe, bars)
-
-                    if len(imported_rows) >= bars or len(imported_rows) > len(ohlcs_rows):
-                        rows = imported_rows
-                    else:
-                        rows = ohlcs_rows
-
-            elif source == "imported":
-                rows = await conn.fetch("""
-                    SELECT ts as timestamp, open, high, low, close, volume
-                    FROM ohlc_imports o
-                    JOIN instruments i ON o.instrument_id = i.id
-                    WHERE i.symbol = $1 AND o.timeframe = $2
-                    ORDER BY ts DESC
-                    LIMIT $3
-                """, symbol, timeframe, bars)
-
-                # Fallback to regular ohlcs view if imported data is missing
-                if not rows:
-                    rows = await conn.fetch("""
-                        SELECT ts as timestamp, open, high, low, close, volume
-                        FROM ohlcs o
-                        JOIN instruments i ON o.instrument_id = i.id
-                        WHERE i.symbol = $1 AND o.timeframe = $2
-                        ORDER BY ts DESC
-                        LIMIT $3
-                    """, symbol, timeframe, bars)
-            else:
-                rows = await conn.fetch("""
-                    SELECT ts as timestamp, open, high, low, close, volume
-                    FROM ohlcs o
-                    JOIN instruments i ON o.instrument_id = i.id
-                    WHERE i.symbol = $1 AND o.timeframe = $2
-                    ORDER BY ts DESC
-                    LIMIT $3
-                """, symbol, timeframe, bars)
-
-        df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        return df
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if df.empty:
+            return df
+        return df.sort_values("timestamp").reset_index(drop=True)
 
     async def _persist_signal(self, signal: Signal) -> Optional[str]:
         """Persist signal to database. Returns signal UUID (id)."""
+        assert self.pool is not None
         async with self.pool.acquire() as conn:
-            # Map symbol to instrument_id (Hyperliquid = exchange_id 1)
-            instrument_id = await conn.fetchval("""
+            instrument_id = await conn.fetchval(
+                """
                 SELECT id FROM instruments WHERE symbol = $1
-            """, signal.symbol)
-            
+                """,
+                signal.symbol,
+            )
+
             if instrument_id is None:
                 logger.warning("Unknown instrument for signal", symbol=signal.symbol)
                 return None
-            
-            # Map side to signal_type/signal_value
+
             signal_type = signal.side.upper() if signal.side else "UNKNOWN"
             signal_value = float(signal.price) if signal.price else 0.0
-            
+
             mode_val = (signal.meta.get("mode") if signal.meta else None) or "paper"
-            row = await conn.fetchrow("""
-                INSERT INTO signals 
+            row = await conn.fetchrow(
+                """
+                INSERT INTO signals
                 (exchange_id, instrument_id, strategy_id, strategy_version,
-                 signal_type, signal_value, confidence, payload, mode, 
+                 signal_type, signal_value, confidence, payload, mode,
                  idempotency_key, correlation_id)
                 VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING id
-            """,
-            instrument_id, signal.strategy_id, signal.strategy_version,
-            signal_type, signal_value, signal.confidence,
-            json.dumps(signal.meta), mode_val, 
-            signal.idempotency_key, signal.correlation_id)
+                """,
+                instrument_id,
+                signal.strategy_id,
+                signal.strategy_version,
+                signal_type,
+                signal_value,
+                signal.confidence,
+                json.dumps(signal.meta),
+                mode_val,
+                signal.idempotency_key,
+                signal.correlation_id,
+            )
             return str(row["id"]) if row else None
-            
+
     async def shutdown(self):
         """Cleanup resources."""
         if self.execution_client:

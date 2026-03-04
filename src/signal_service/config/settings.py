@@ -6,12 +6,11 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Settings:
     """Signal Service configuration."""
-    
+
     database_url: str
     dataservice_addr: str
     signalservice_port: int
-    executionservice_addr: str = "localhost:50053"
-    
+
     # OHLC subscription defaults
     default_symbols: list[str] = None
     default_timeframes: list[str] = None

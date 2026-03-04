@@ -17,7 +17,6 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from structlog import get_logger
 
 import signal_service.strategy  # registers supported strategies
-from signal_service.grpc.execution_client import ExecutionServiceClient
 from varon_fi import BaseStrategy, Signal, StrategyConfig, create_strategy, list_strategies
 from varon_fi.proto.varon_fi_pb2 import TraceContext, TradeSignal
 
@@ -32,12 +31,10 @@ class StrategyEngine:
     def __init__(
         self,
         database_url: str,
-        execution_client: Optional[ExecutionServiceClient] = None,
     ):
         self.database_url = database_url
         self.pool: Optional[asyncpg.Pool] = None
         self.strategies: dict[str, BaseStrategy] = {}
-        self.execution_client = execution_client
         # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals.
         self._last_candle_ts: dict[str, datetime] = {}
         # Track warmup requirements per strategy/symbol/timeframe.
@@ -56,12 +53,6 @@ class StrategyEngine:
         self._strategy_fingerprints: dict[str, dict[str, str]] = {}
         # Track first-candle fingerprint log emission per strategy/symbol/timeframe.
         self._fingerprint_logged_combos: set[str] = set()
-
-    async def connect_execution_service(self, addr: str):
-        """Connect to ExecutionService for signal forwarding."""
-        self.execution_client = ExecutionServiceClient(addr)
-        await self.execution_client.connect()
-        logger.info("ExecutionService client connected", addr=addr)
 
     async def initialize(self):
         """Initialize DB connection and load active strategies."""
@@ -549,18 +540,6 @@ class StrategyEngine:
             if signal_db_id:
                 signal.signal_db_id = signal_db_id
 
-            if self.execution_client:
-                try:
-                    trade_signal = self._to_trade_signal(signal, signal_db_id)
-                    await self.execution_client.execute_signal(trade_signal)
-                except Exception as e:
-                    logger.error(
-                        "Failed to send signal to ExecutionService",
-                        signal_id=signal_db_id or signal.idempotency_key,
-                        correlation_id=signal.correlation_id,
-                        error=str(e),
-                    )
-
             logger.info(
                 "Signal generated",
                 strategy=strategy.name,
@@ -736,8 +715,6 @@ class StrategyEngine:
 
     async def shutdown(self):
         """Cleanup resources."""
-        if self.execution_client:
-            await self.execution_client.disconnect()
         if self.pool:
             await self.pool.close()
         logger.info("StrategyEngine shutdown")

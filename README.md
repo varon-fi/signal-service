@@ -7,7 +7,6 @@ Real-time trading signal generation service for varon.fi.
 - Load active strategies from Postgres
 - Generate trading signals and emit `TradeSignal` events via gRPC
 - Persist signals to Postgres
-- Forward signals to Execution Service
 - Remain mode-agnostic for signal generation (paper/live routing is handled downstream)
 
 ## Active Strategy Surface
@@ -43,10 +42,9 @@ python -m signal_service.main
 - `DATABASE_URL`: Postgres connection string
 - `DATASERVICE_GRPC_ADDR`: DataService gRPC endpoint (default `localhost:50051`)
 - `SIGNALSERVICE_GRPC_PORT`: SignalService gRPC port (default `50052`)
-- `EXECUTIONSERVICE_GRPC_ADDR`: ExecutionService gRPC endpoint (default `localhost:50053`)
 
 ## Strategy Loading
 - Strategies are loaded from Postgres at startup (`status='active'`).
 - Unsupported strategy names are skipped.
 - Restart service to apply strategy config changes.
-- Strategy configs are aggregated across modes; signal-service does not split runtimes by trading mode.
+- Strategy configs are loaded from the canonical `(strategy_id, symbol, timeframe)` scope.

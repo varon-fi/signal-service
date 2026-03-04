@@ -6,7 +6,6 @@ Fixed to subscribe to all timeframes needed by active strategies.
 
 import asyncio
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -42,7 +41,7 @@ async def stream_for_timeframe(
 async def main():
     """Run the Signal Service."""
     settings = Settings(
-        database_url=os.getenv("DATABASE_URL", "postgresql://postgres@localhost/varon_fi"),
+        database_url=os.getenv("DATABASE_URL", "postgresql:///varon_fi?user=varon"),
         dataservice_addr=os.getenv("DATASERVICE_GRPC_ADDR", "localhost:50051"),
         signalservice_port=int(os.getenv("SIGNALSERVICE_GRPC_PORT", "50052")),
     )

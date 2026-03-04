@@ -45,9 +45,9 @@ async def test_load_strategies_from_db():
     rows = [
         {
             "id": "11111111-1111-1111-1111-111111111111",
-            "name": "mtf_confluence",
+            "name": "range_mean_reversion",
             "type": "ta_lib",
-            "params": {"htf_ema_len": 50},
+            "params": {"vwap_lookback": 20},
             "symbols": ["BTC"],
             "timeframes": ["5m"],
             "version": "1.0.0",

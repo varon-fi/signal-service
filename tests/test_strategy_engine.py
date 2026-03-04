@@ -79,7 +79,7 @@ async def test_load_strategies_from_db():
 
     await engine._load_strategies()
 
-    assert "11111111-1111-1111-1111-111111111111" in engine.strategies
+    assert "11111111-1111-1111-1111-111111111111:live" in engine.strategies
     assert conn.last_args == ()
     assert "status = 'active'" in conn.last_query
 

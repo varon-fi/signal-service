@@ -99,9 +99,22 @@ class StrategyEngine:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT *
-                FROM strategies
-                WHERE status = 'active'
+                SELECT
+                    s.id,
+                    s.name,
+                    s.version,
+                    s.params,
+                    s.init_periods,
+                    s.status,
+                    sc.mode,
+                    ARRAY_AGG(DISTINCT sc.symbol ORDER BY sc.symbol) AS symbols,
+                    ARRAY_AGG(DISTINCT sc.timeframe ORDER BY sc.timeframe) AS timeframes
+                FROM strategies s
+                JOIN strategy_configs sc
+                  ON sc.strategy_id = s.id
+                WHERE s.status = 'active'
+                  AND sc.enabled = TRUE
+                GROUP BY s.id, s.name, s.version, s.params, s.init_periods, s.status, sc.mode
                 """
             )
 
@@ -111,14 +124,17 @@ class StrategyEngine:
                 continue
 
             strategy_id = str(row["id"])
-            self.strategies[strategy_id] = strategy
+            strategy_mode = str(row["mode"]) if row.get("mode") else "paper"
+            strategy_key = f"{strategy_id}:{strategy_mode}"
+            self.strategies[strategy_key] = strategy
 
             fingerprint = self._build_strategy_fingerprint(strategy)
-            self._strategy_fingerprints[strategy_id] = fingerprint
+            self._strategy_fingerprints[strategy_key] = fingerprint
             logger.info(
                 "Strategy runtime fingerprint",
                 stage="startup",
                 strategy_id=strategy_id,
+                mode=strategy_mode,
                 strategy_name=strategy.name,
                 strategy_version=strategy.version,
                 module_path=fingerprint["module_path"],
@@ -130,7 +146,7 @@ class StrategyEngine:
             init_periods = row.get("init_periods") if isinstance(row, dict) else row.get("init_periods")
             for symbol in strategy.symbols:
                 for timeframe in strategy.timeframes:
-                    warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+                    warmup_key = f"{strategy_key}:{symbol}:{timeframe}"
                     required = int(init_periods) if init_periods else 0
                     self._warmup_required[warmup_key] = required
                     self._warmup_complete[warmup_key] = required == 0
@@ -330,10 +346,11 @@ class StrategyEngine:
             return
 
         async with self.pool.acquire() as conn:
-            for strategy_id, strategy in self.strategies.items():
+            for strategy_key, strategy in self.strategies.items():
                 if not hasattr(strategy, "_positions"):
                     continue
 
+                strategy_id = str(getattr(strategy, "strategy_id", "") or strategy_key.split(":", 1)[0])
                 mode = str(getattr(strategy, "mode", "paper") or "paper")
                 for symbol in strategy.symbols:
                     row = await conn.fetchrow(
@@ -369,6 +386,7 @@ class StrategyEngine:
                     logger.info(
                         "Hydrated position state",
                         strategy=strategy.name,
+                        strategy_id=strategy_id,
                         symbol=symbol,
                         mode=mode,
                         side=side,
@@ -437,11 +455,12 @@ class StrategyEngine:
         strategies_evaluated = 0
         signals_emitted = 0
 
-        for strategy_id, strategy in self.strategies.items():
+        for strategy_key, strategy in self.strategies.items():
             if symbol not in strategy.symbols or timeframe not in strategy.timeframes:
                 continue
 
             strategies_evaluated += 1
+            strategy_id = str(getattr(strategy, "strategy_id", "") or strategy_key.split(":", 1)[0])
 
             candle_ts = self._normalize_candle_ts(ohlc.get("timestamp") or ohlc.get("ts"))
 
@@ -455,13 +474,13 @@ class StrategyEngine:
                     continue
 
             if candle_ts is not None:
-                dedupe_key = f"{strategy_id}:{symbol}:{timeframe}"
+                dedupe_key = f"{strategy_key}:{symbol}:{timeframe}"
                 last_ts = self._last_candle_ts.get(dedupe_key)
                 if last_ts is not None and candle_ts <= last_ts:
                     continue
                 self._last_candle_ts[dedupe_key] = candle_ts
 
-            warmup_key = f"{strategy_id}:{symbol}:{timeframe}"
+            warmup_key = f"{strategy_key}:{symbol}:{timeframe}"
             required = self._warmup_required.get(warmup_key, 0)
             lookback_days = (strategy.params or {}).get("lookback_days")
             lookback_bars = self._calc_lookback_bars(timeframe, lookback_days)
@@ -489,7 +508,7 @@ class StrategyEngine:
                 )
 
             self._emit_first_candle_fingerprint(
-                strategy_id=strategy_id,
+                strategy_id=strategy_key,
                 symbol=symbol,
                 timeframe=timeframe,
             )
@@ -508,7 +527,7 @@ class StrategyEngine:
             if getattr(strategy, "mode", None):
                 signal.meta["mode"] = getattr(strategy, "mode")
 
-            self._attach_strategy_fingerprint_meta(signal, strategy_id)
+            self._attach_strategy_fingerprint_meta(signal, strategy_key)
 
             signal_db_id = await self._persist_signal(signal)
             if signal_db_id:

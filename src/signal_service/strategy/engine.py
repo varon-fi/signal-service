@@ -17,9 +17,8 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from structlog import get_logger
 
 import signal_service.strategy  # registers supported strategies
-from signal_service.grpc.execution_client import ExecutionServiceClient
 from varon_fi import BaseStrategy, Signal, StrategyConfig, create_strategy, list_strategies
-from varon_fi.proto.varon_fi_pb2 import TraceContext, TradeSignal, TradingMode
+from varon_fi.proto.varon_fi_pb2 import TraceContext, TradeSignal
 
 logger = get_logger(__name__)
 
@@ -32,12 +31,10 @@ class StrategyEngine:
     def __init__(
         self,
         database_url: str,
-        execution_client: Optional[ExecutionServiceClient] = None,
     ):
         self.database_url = database_url
         self.pool: Optional[asyncpg.Pool] = None
         self.strategies: dict[str, BaseStrategy] = {}
-        self.execution_client = execution_client
         # Track last processed candle per strategy/symbol/timeframe to prevent duplicate signals.
         self._last_candle_ts: dict[str, datetime] = {}
         # Track warmup requirements per strategy/symbol/timeframe.
@@ -56,12 +53,6 @@ class StrategyEngine:
         self._strategy_fingerprints: dict[str, dict[str, str]] = {}
         # Track first-candle fingerprint log emission per strategy/symbol/timeframe.
         self._fingerprint_logged_combos: set[str] = set()
-
-    async def connect_execution_service(self, addr: str):
-        """Connect to ExecutionService for signal forwarding."""
-        self.execution_client = ExecutionServiceClient(addr)
-        await self.execution_client.connect()
-        logger.info("ExecutionService client connected", addr=addr)
 
     async def initialize(self):
         """Initialize DB connection and load active strategies."""
@@ -106,7 +97,6 @@ class StrategyEngine:
                     s.params,
                     s.init_periods,
                     s.status,
-                    sc.mode,
                     ARRAY_AGG(DISTINCT sc.symbol ORDER BY sc.symbol) AS symbols,
                     ARRAY_AGG(DISTINCT sc.timeframe ORDER BY sc.timeframe) AS timeframes
                 FROM strategies s
@@ -114,7 +104,7 @@ class StrategyEngine:
                   ON sc.strategy_id = s.id
                 WHERE s.status = 'active'
                   AND sc.enabled = TRUE
-                GROUP BY s.id, s.name, s.version, s.params, s.init_periods, s.status, sc.mode
+                GROUP BY s.id, s.name, s.version, s.params, s.init_periods, s.status
                 """
             )
 
@@ -124,8 +114,7 @@ class StrategyEngine:
                 continue
 
             strategy_id = str(row["id"])
-            strategy_mode = str(row["mode"]) if row.get("mode") else "paper"
-            strategy_key = f"{strategy_id}:{strategy_mode}"
+            strategy_key = strategy_id
             self.strategies[strategy_key] = strategy
 
             fingerprint = self._build_strategy_fingerprint(strategy)
@@ -134,7 +123,6 @@ class StrategyEngine:
                 "Strategy runtime fingerprint",
                 stage="startup",
                 strategy_id=strategy_id,
-                mode=strategy_mode,
                 strategy_name=strategy.name,
                 strategy_version=strategy.version,
                 module_path=fingerprint["module_path"],
@@ -191,9 +179,6 @@ class StrategyEngine:
                 symbols=row["symbols"],
                 timeframes=row["timeframes"],
             )
-            mode_val = row.get("mode") if isinstance(row, dict) else row.get("mode")
-            if mode_val:
-                setattr(strategy, "mode", str(mode_val))
             return strategy
         except KeyError:
             logger.warning(
@@ -341,7 +326,7 @@ class StrategyEngine:
                         )
 
     async def _initialize_positions_state(self):
-        """Hydrate in-memory strategy positions from DB when strategies track state."""
+        """Hydrate strategy position state from latest canonical signal history."""
         if not self.strategies or not self.pool:
             return
 
@@ -350,45 +335,69 @@ class StrategyEngine:
                 if not hasattr(strategy, "_positions"):
                     continue
 
-                strategy_id = str(getattr(strategy, "strategy_id", "") or strategy_key.split(":", 1)[0])
-                mode = str(getattr(strategy, "mode", "paper") or "paper")
+                strategy_id = str(getattr(strategy, "strategy_id", "") or strategy_key)
                 for symbol in strategy.symbols:
                     row = await conn.fetchrow(
                         """
-                        SELECT quantity, avg_entry_price, entry_ts
-                        FROM positions
-                        WHERE strategy_id = $1 AND symbol = $2 AND mode = $3
+                        SELECT s.signal_type, s.signal_value, s.ts, s.payload
+                        FROM signals s
+                        JOIN instruments i ON s.instrument_id = i.id
+                        WHERE s.strategy_id = $1
+                          AND i.symbol = $2
+                        ORDER BY s.ts DESC
+                        LIMIT 1
                         """,
                         strategy_id,
                         symbol,
-                        mode,
                     )
-                    if not row or row["quantity"] is None or float(row["quantity"]) == 0:
+                    if not row:
                         continue
 
-                    qty = float(row["quantity"])
-                    side = "long" if qty > 0 else "short"
-                    entry_price = float(row["avg_entry_price"]) if row["avg_entry_price"] else None
-                    entry_ts_raw = row["entry_ts"]
+                    signal_type = str(row["signal_type"] or "").upper()
+                    if signal_type in {"FLAT", "NONE", "UNKNOWN", ""}:
+                        continue
+
+                    if signal_type in {"LONG", "BUY"}:
+                        side = "long"
+                    elif signal_type in {"SHORT", "SELL"}:
+                        side = "short"
+                    else:
+                        continue
+
+                    signal_value = row["signal_value"]
+                    entry_price = float(signal_value) if signal_value is not None else None
+                    entry_ts_raw = row["ts"]
                     entry_ts = (
                         self._normalize_candle_ts(entry_ts_raw)
                         if entry_ts_raw is not None
                         else None
                     )
 
+                    payload = row["payload"]
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload) if payload else {}
+                        except json.JSONDecodeError:
+                            payload = {}
+                    payload = payload or {}
+                    try:
+                        entry_deviation = float(payload.get("deviation_pct", 0.0))
+                    except (TypeError, ValueError):
+                        entry_deviation = 0.0
+
                     strategy._positions[symbol] = {
                         "side": side,
                         "entry_price": entry_price,
                         "entry_ts": entry_ts,
-                        # No reliable historical entry deviation in positions table.
-                        "entry_deviation": 0.0,
+                        "entry_deviation": entry_deviation,
                     }
                     logger.info(
                         "Hydrated position state",
+                        source="signals_history",
                         strategy=strategy.name,
                         strategy_id=strategy_id,
                         symbol=symbol,
-                        mode=mode,
+                        signal_type=signal_type,
                         side=side,
                         entry_price=entry_price,
                         entry_ts=entry_ts,
@@ -524,26 +533,12 @@ class StrategyEngine:
 
             if signal.meta is None:
                 signal.meta = {}
-            if getattr(strategy, "mode", None):
-                signal.meta["mode"] = getattr(strategy, "mode")
 
             self._attach_strategy_fingerprint_meta(signal, strategy_key)
 
             signal_db_id = await self._persist_signal(signal)
             if signal_db_id:
                 signal.signal_db_id = signal_db_id
-
-            if self.execution_client:
-                try:
-                    trade_signal = self._to_trade_signal(signal, signal_db_id)
-                    await self.execution_client.execute_signal(trade_signal)
-                except Exception as e:
-                    logger.error(
-                        "Failed to send signal to ExecutionService",
-                        signal_id=signal_db_id or signal.idempotency_key,
-                        correlation_id=signal.correlation_id,
-                        error=str(e),
-                    )
 
             logger.info(
                 "Signal generated",
@@ -616,9 +611,6 @@ class StrategyEngine:
 
         meta = self._normalize_meta(signal.meta)
 
-        mode_str = str(meta.get("mode") or "paper").lower()
-        mode = TradingMode.LIVE if mode_str == "live" else TradingMode.PAPER
-
         trace = TraceContext(
             correlation_id=signal.correlation_id if signal.correlation_id else str(uuid.uuid4()),
             idempotency_key=signal.idempotency_key if signal.idempotency_key else str(uuid.uuid4()),
@@ -636,7 +628,6 @@ class StrategyEngine:
             side=signal.side,
             price=signal.price or 0.0,
             confidence=signal.confidence,
-            mode=mode,
             meta={str(k): "" if v is None else str(v) for k, v in meta.items()},
             trace=trace,
         )
@@ -701,14 +692,13 @@ class StrategyEngine:
             signal_type = signal.side.upper() if signal.side else "UNKNOWN"
             signal_value = float(signal.price) if signal.price else 0.0
 
-            mode_val = (signal.meta.get("mode") if signal.meta else None) or "paper"
             row = await conn.fetchrow(
                 """
                 INSERT INTO signals
                 (exchange_id, instrument_id, strategy_id, strategy_version,
-                 signal_type, signal_value, confidence, payload, mode,
+                 signal_type, signal_value, confidence, payload,
                  idempotency_key, correlation_id)
-                VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING id
                 """,
                 instrument_id,
@@ -718,7 +708,6 @@ class StrategyEngine:
                 signal_value,
                 signal.confidence,
                 json.dumps(signal.meta),
-                mode_val,
                 signal.idempotency_key,
                 signal.correlation_id,
             )
@@ -726,8 +715,6 @@ class StrategyEngine:
 
     async def shutdown(self):
         """Cleanup resources."""
-        if self.execution_client:
-            await self.execution_client.disconnect()
         if self.pool:
             await self.pool.close()
         logger.info("StrategyEngine shutdown")

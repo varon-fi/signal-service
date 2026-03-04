@@ -2,7 +2,6 @@
 
 import asyncio
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -17,18 +16,14 @@ load_dotenv()
 async def main():
     """Run the Signal Service for local E2E testing."""
     settings = Settings(
-        database_url=os.getenv("DATABASE_URL", "postgresql://postgres@localhost/varon_fi"),
+        database_url=os.getenv("DATABASE_URL", "postgresql:///varon_fi?user=varon"),
         dataservice_addr=os.getenv("DATASERVICE_GRPC_ADDR", "localhost:50051"),
         signalservice_port=int(os.getenv("SIGNALSERVICE_GRPC_PORT", "50052")),
-        executionservice_addr=os.getenv("EXECUTIONSERVICE_GRPC_ADDR", "localhost:50053"),
     )
     
     # Initialize strategy engine
     engine = StrategyEngine(settings.database_url)
     await engine.initialize()
-    
-    # Connect to ExecutionService for forwarding signals (via engine)
-    await engine.connect_execution_service(settings.executionservice_addr)
     
     # Connect to DataService
     data_client = DataServiceClient(settings.dataservice_addr)
@@ -40,13 +35,13 @@ async def main():
     
     print(f"Signal Service running on port {settings.signalservice_port}")
     print(f"Connected to DataService at {settings.dataservice_addr}")
-    print(f"Forwarding signals to ExecutionService at {settings.executionservice_addr}")
     
     try:
         # Subscribe to OHLC stream and process
         async for ohlc in data_client.stream_ohlc():
-            signal = await engine.process_candle(ohlc)
-            if signal:
+            signals = await engine.process_candle_signals(ohlc)
+            for signal in signals:
+                await server.emit_signal(signal)
                 print(f"[Signal Service] Generated signal: {signal.symbol} {signal.side}")
     except asyncio.CancelledError:
         pass

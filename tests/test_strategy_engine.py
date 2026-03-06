@@ -65,8 +65,9 @@ async def test_load_strategies_from_db():
             "name": "range_mean_reversion",
             "type": "ta_lib",
             "params": {"vwap_lookback": 20},
-            "symbols": ["BTC"],
-            "timeframes": ["5m"],
+            "symbol": "BTC",
+            "timeframe": "5m",
+            "meta": {},
             "version": "1.0.0",
             "mode": "live",
             "is_live": True,
@@ -79,10 +80,50 @@ async def test_load_strategies_from_db():
 
     await engine._load_strategies()
 
-    assert "11111111-1111-1111-1111-111111111111" in engine.strategies
+    assert "11111111-1111-1111-1111-111111111111:BTC:5m" in engine.strategies
     assert conn.last_args == ()
     assert "status = 'active'" in conn.last_query
     assert "sc.mode" not in conn.last_query
+
+
+def test_create_strategy_merges_symbol_params_override():
+    row = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "name": "range_mean_reversion",
+        "params": {"vwap_lookback": 20, "rsi_period": 14},
+        "version": "1.1.0",
+        "symbol": "BTC",
+        "timeframe": "5m",
+        "meta": {"strategy_params": {"vwap_lookback": 28, "deviation_pct": 1.3}},
+    }
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+
+    strategy = engine._create_strategy(row)
+
+    assert strategy is not None
+    assert strategy.params["vwap_lookback"] == 28
+    assert strategy.params["rsi_period"] == 14
+    assert strategy.params["deviation_pct"] == 1.3
+    assert strategy.symbols == ["BTC"]
+    assert strategy.timeframes == ["5m"]
+
+
+def test_create_strategy_ignores_invalid_symbol_params_override():
+    row = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "name": "range_mean_reversion",
+        "params": {"vwap_lookback": 20},
+        "version": "1.1.0",
+        "symbol": "BTC",
+        "timeframe": "5m",
+        "meta": {"strategy_params": ["bad", "shape"]},
+    }
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+
+    strategy = engine._create_strategy(row)
+
+    assert strategy is not None
+    assert strategy.params["vwap_lookback"] == 20
 
 
 class DummyStrategy:

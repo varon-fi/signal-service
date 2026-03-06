@@ -86,6 +86,43 @@ async def test_load_strategies_from_db():
     assert "sc.mode" not in conn.last_query
 
 
+@pytest.mark.asyncio
+async def test_load_strategies_skips_duplicate_strategy_keys():
+    rows = [
+        {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "name": "range_mean_reversion",
+            "type": "ta_lib",
+            "params": {"vwap_lookback": 20},
+            "symbol": "BTC",
+            "timeframe": "5m",
+            "meta": {},
+            "version": "1.0.0",
+            "status": "active",
+        },
+        {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "name": "range_mean_reversion",
+            "type": "ta_lib",
+            "params": {"vwap_lookback": 99},
+            "symbol": "BTC",
+            "timeframe": "5m",
+            "meta": {},
+            "version": "1.0.0",
+            "status": "active",
+        },
+    ]
+    conn = FakeConn(rows)
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    engine.pool = FakePool(conn)
+
+    await engine._load_strategies()
+
+    key = "11111111-1111-1111-1111-111111111111:BTC:5m"
+    assert set(engine.strategies.keys()) == {key}
+    assert engine.strategies[key].params["vwap_lookback"] == 20
+
+
 def test_create_strategy_merges_symbol_params_override():
     row = {
         "id": "11111111-1111-1111-1111-111111111111",

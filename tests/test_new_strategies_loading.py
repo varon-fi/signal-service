@@ -44,8 +44,9 @@ async def test_load_range_mean_reversion_only():
             "name": "range_mean_reversion",
             "type": "ta_lib",
             "params": '{"vwap_lookback": 20, "rsi_period": 14}',
-            "symbols": ["BTC", "ETH"],
-            "timeframes": ["5m"],
+            "symbol": "BTC",
+            "timeframe": "5m",
+            "meta": {"strategy_params": {"vwap_lookback": 28}},
             "version": "1.1.0",
             "mode": "paper",
             "is_live": True,
@@ -58,10 +59,11 @@ async def test_load_range_mean_reversion_only():
 
     await engine._load_strategies()
 
-    assert "ffffffff-ffff-ffff-ffff-ffffffffffff" in engine.strategies
-    strategy = engine.strategies["ffffffff-ffff-ffff-ffff-ffffffffffff"]
+    assert "ffffffff-ffff-ffff-ffff-ffffffffffff:BTC:5m" in engine.strategies
+    strategy = engine.strategies["ffffffff-ffff-ffff-ffff-ffffffffffff:BTC:5m"]
     assert strategy.name == "range_mean_reversion"
-    assert strategy.params["vwap_lookback"] == 20
+    assert strategy.params["vwap_lookback"] == 28
+    assert strategy.params["rsi_period"] == 14
 
 
 @pytest.mark.asyncio
@@ -72,8 +74,9 @@ async def test_skip_unsupported_strategy_names():
             "name": "legacy_strategy",
             "type": "ta_lib",
             "params": '{}',
-            "symbols": ["BTC"],
-            "timeframes": ["5m"],
+            "symbol": "BTC",
+            "timeframe": "5m",
+            "meta": {},
             "version": "1.0.0",
             "mode": "paper",
             "is_live": True,
@@ -84,8 +87,9 @@ async def test_skip_unsupported_strategy_names():
             "name": "range_mean_reversion",
             "type": "ta_lib",
             "params": '{}',
-            "symbols": ["BTC"],
-            "timeframes": ["5m"],
+            "symbol": "BTC",
+            "timeframe": "5m",
+            "meta": {},
             "version": "1.1.0",
             "mode": "paper",
             "is_live": True,
@@ -100,4 +104,4 @@ async def test_skip_unsupported_strategy_names():
     await engine._load_strategies()
 
     loaded_ids = set(engine.strategies.keys())
-    assert loaded_ids == {"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}
+    assert loaded_ids == {"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:BTC:5m"}

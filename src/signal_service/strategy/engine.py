@@ -97,14 +97,15 @@ class StrategyEngine:
                     s.params,
                     s.init_periods,
                     s.status,
-                    ARRAY_AGG(DISTINCT sc.symbol ORDER BY sc.symbol) AS symbols,
-                    ARRAY_AGG(DISTINCT sc.timeframe ORDER BY sc.timeframe) AS timeframes
+                    sc.symbol,
+                    sc.timeframe,
+                    sc.meta
                 FROM strategies s
                 JOIN strategy_configs sc
                   ON sc.strategy_id = s.id
                 WHERE s.status = 'active'
                   AND sc.enabled = TRUE
-                GROUP BY s.id, s.name, s.version, s.params, s.init_periods, s.status
+                ORDER BY s.id, sc.symbol, sc.timeframe
                 """
             )
 
@@ -114,7 +115,9 @@ class StrategyEngine:
                 continue
 
             strategy_id = str(row["id"])
-            strategy_key = strategy_id
+            symbol = str(row["symbol"])
+            timeframe = str(row["timeframe"])
+            strategy_key = f"{strategy_id}:{symbol}:{timeframe}"
             self.strategies[strategy_key] = strategy
 
             fingerprint = self._build_strategy_fingerprint(strategy)
@@ -160,9 +163,30 @@ class StrategyEngine:
         raw_params = row.get("params") if isinstance(row, dict) else row["params"]
         if raw_params is None:
             logger.warning("Strategy missing params; defaulting to empty", name=name)
-            params = {}
+            params: dict = {}
         else:
-            params = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+            parsed_params = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+            if not isinstance(parsed_params, dict):
+                logger.warning("Strategy params must be object; defaulting to empty", name=name)
+                params = {}
+            else:
+                params = parsed_params
+
+        raw_meta = row.get("meta") if isinstance(row, dict) else row["meta"]
+        meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+        if not isinstance(meta, dict):
+            logger.warning("Strategy config meta must be object; ignoring", name=name, meta_type=type(meta).__name__)
+            meta = {}
+
+        override_params = meta.get("strategy_params", {})
+        if not isinstance(override_params, dict):
+            logger.warning(
+                "strategy_configs.meta.strategy_params must be object; ignoring override",
+                name=name,
+                override_type=type(override_params).__name__,
+            )
+            override_params = {}
+        params = {**params, **override_params}
 
         version = row.get("version") if isinstance(row, dict) else row["version"]
         if not version:
@@ -170,14 +194,16 @@ class StrategyEngine:
             version = "1.0.0"
 
         config = StrategyConfig(name=name, params=params)
+        symbol = row.get("symbol") if isinstance(row, dict) else row["symbol"]
+        timeframe = row.get("timeframe") if isinstance(row, dict) else row["timeframe"]
         try:
             strategy = create_strategy(
                 config,
                 strategy_id=str(row["id"]),
                 name=name,
                 version=version,
-                symbols=row["symbols"],
-                timeframes=row["timeframes"],
+                symbols=[str(symbol)],
+                timeframes=[str(timeframe)],
             )
             return strategy
         except KeyError:

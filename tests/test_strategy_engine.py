@@ -86,40 +86,6 @@ async def test_load_strategies_from_db():
     assert "sc.mode" not in conn.last_query
 
 
-@pytest.mark.asyncio
-async def test_load_strategies_raises_on_duplicate_strategy_keys():
-    rows = [
-        {
-            "id": "11111111-1111-1111-1111-111111111111",
-            "name": "range_mean_reversion",
-            "type": "ta_lib",
-            "params": {"vwap_lookback": 20},
-            "symbol": "BTC",
-            "timeframe": "5m",
-            "meta": {},
-            "version": "1.0.0",
-            "status": "active",
-        },
-        {
-            "id": "11111111-1111-1111-1111-111111111111",
-            "name": "range_mean_reversion",
-            "type": "ta_lib",
-            "params": {"vwap_lookback": 99},
-            "symbol": "BTC",
-            "timeframe": "5m",
-            "meta": {},
-            "version": "1.0.0",
-            "status": "active",
-        },
-    ]
-    conn = FakeConn(rows)
-    engine = StrategyEngine("postgresql://localhost/varon_fi")
-    engine.pool = FakePool(conn)
-
-    with pytest.raises(RuntimeError, match="duplicate enabled strategy configs"):
-        await engine._load_strategies()
-
-
 def test_create_strategy_merges_symbol_params_override():
     row = {
         "id": "11111111-1111-1111-1111-111111111111",

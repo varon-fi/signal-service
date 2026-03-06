@@ -109,6 +109,19 @@ class StrategyEngine:
                 """
             )
 
+        counts: dict[str, int] = {}
+        for row in rows:
+            strategy_key = f"{row['id']}:{row['symbol']}:{row['timeframe']}"
+            counts[strategy_key] = counts.get(strategy_key, 0) + 1
+
+        duplicate_keys = sorted([key for key, count in counts.items() if count > 1])
+        if duplicate_keys:
+            logger.error(
+                "Duplicate enabled strategy config keys detected; aborting load",
+                duplicate_keys=duplicate_keys,
+            )
+            raise RuntimeError(f"duplicate enabled strategy configs: {', '.join(duplicate_keys)}")
+
         for row in rows:
             strategy = self._create_strategy(row)
             if strategy is None:
@@ -118,14 +131,6 @@ class StrategyEngine:
             symbol = str(row["symbol"])
             timeframe = str(row["timeframe"])
             strategy_key = f"{strategy_id}:{symbol}:{timeframe}"
-            if strategy_key in self.strategies:
-                logger.error(
-                    "Duplicate strategy config key detected; ignoring duplicate row",
-                    strategy_id=strategy_id,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                )
-                continue
             self.strategies[strategy_key] = strategy
 
             fingerprint = self._build_strategy_fingerprint(strategy)

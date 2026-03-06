@@ -87,7 +87,7 @@ async def test_load_strategies_from_db():
 
 
 @pytest.mark.asyncio
-async def test_load_strategies_skips_duplicate_strategy_keys():
+async def test_load_strategies_raises_on_duplicate_strategy_keys():
     rows = [
         {
             "id": "11111111-1111-1111-1111-111111111111",
@@ -116,11 +116,8 @@ async def test_load_strategies_skips_duplicate_strategy_keys():
     engine = StrategyEngine("postgresql://localhost/varon_fi")
     engine.pool = FakePool(conn)
 
-    await engine._load_strategies()
-
-    key = "11111111-1111-1111-1111-111111111111:BTC:5m"
-    assert set(engine.strategies.keys()) == {key}
-    assert engine.strategies[key].params["vwap_lookback"] == 20
+    with pytest.raises(RuntimeError, match="duplicate enabled strategy configs"):
+        await engine._load_strategies()
 
 
 def test_create_strategy_merges_symbol_params_override():

@@ -521,15 +521,29 @@ class StrategyEngine:
             lookback_bars = self._calc_lookback_bars(timeframe, lookback_days)
             bars_needed = max(200, required, lookback_bars) if lookback_bars else max(200, required)
             history = await self._fetch_history(symbol, timeframe, bars=bars_needed)
+            confirmed_ohlc, confirmed_history = self._confirmed_candle_view(
+                symbol=symbol,
+                timeframe=timeframe,
+                incoming_ohlc=ohlc,
+                history=history,
+            )
+            if confirmed_ohlc is None or confirmed_history.empty:
+                logger.debug(
+                    "Skipping signal - no confirmed candle available",
+                    strategy=strategy.name,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
+                continue
 
             if required > 0 and not self._warmup_complete.get(warmup_key, True):
-                if len(history) < required:
+                if len(confirmed_history) < required:
                     logger.debug(
                         "Skipping signal - warmup in progress",
                         strategy=strategy.name,
                         symbol=symbol,
                         timeframe=timeframe,
-                        history_bars=len(history),
+                        history_bars=len(confirmed_history),
                         required_bars=required,
                     )
                     continue
@@ -539,7 +553,7 @@ class StrategyEngine:
                     strategy=strategy.name,
                     symbol=symbol,
                     timeframe=timeframe,
-                    history_bars=len(history),
+                    history_bars=len(confirmed_history),
                 )
 
             self._emit_first_candle_fingerprint(
@@ -548,7 +562,7 @@ class StrategyEngine:
                 timeframe=timeframe,
             )
 
-            signal = strategy.on_candle(ohlc, history)
+            signal = strategy.on_candle(confirmed_ohlc, confirmed_history)
             if not signal:
                 continue
 
@@ -591,6 +605,51 @@ class StrategyEngine:
             )
 
         return signals
+
+    def _confirmed_candle_view(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        incoming_ohlc: dict,
+        history: pd.DataFrame,
+    ) -> tuple[Optional[dict], pd.DataFrame]:
+        """Evaluate strategies on the latest confirmed candle, not the just-opened bar."""
+        if history.empty:
+            return None, history
+
+        history_df = history.copy()
+        ts_col = "timestamp" if "timestamp" in history_df.columns else "ts" if "ts" in history_df.columns else None
+        if ts_col is None:
+            return None, history_df.iloc[0:0]
+
+        history_df = history_df.sort_values(ts_col).reset_index(drop=True)
+        incoming_ts = self._normalize_candle_ts(incoming_ohlc.get("timestamp") or incoming_ohlc.get("ts"))
+        latest_ts = self._normalize_candle_ts(history_df.iloc[-1][ts_col])
+
+        # When a new bar first appears in `ohlcs`, it is still forming and may be
+        # reconciled later. Evaluate the previous completed candle instead.
+        if incoming_ts is not None and latest_ts is not None and latest_ts >= incoming_ts:
+            history_df = history_df.iloc[:-1].reset_index(drop=True)
+
+        if history_df.empty:
+            return None, history_df
+
+        confirmed = history_df.iloc[-1]
+        confirmed_ohlc = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "timestamp": confirmed[ts_col],
+            "open": float(confirmed["open"]),
+            "high": float(confirmed["high"]),
+            "low": float(confirmed["low"]),
+            "close": float(confirmed["close"]),
+            "volume": float(confirmed["volume"]),
+        }
+        if "count" in confirmed.index and confirmed["count"] is not None and not pd.isna(confirmed["count"]):
+            confirmed_ohlc["count"] = int(confirmed["count"])
+
+        return confirmed_ohlc, history_df
 
     async def process_candle(self, ohlc: dict) -> Optional[Signal]:
         """Backward-compatible wrapper returning the first generated signal."""

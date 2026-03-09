@@ -139,6 +139,18 @@ class DummyStrategy:
         return Signal(side=self._side, price=50000.0, confidence=0.6)
 
 
+class RecordingStrategy(DummyStrategy):
+    def __init__(self):
+        super().__init__("recorder", "long")
+        self.last_ohlc = None
+        self.last_history = None
+
+    def on_candle(self, ohlc, history):
+        self.last_ohlc = ohlc
+        self.last_history = history.copy()
+        return super().on_candle(ohlc, history)
+
+
 class DummyStateStrategy:
     def __init__(self):
         self.name = "range_mean_reversion"
@@ -160,7 +172,10 @@ async def test_process_candle_signals_emits_all_matching_strategies(monkeypatch)
 
     async def fake_fetch_history(*_args, **_kwargs):
         return pd.DataFrame(
-            [{"timestamp": datetime.now(timezone.utc), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}]
+            [
+                {"timestamp": datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+                {"timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc), "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+            ]
         )
 
     persisted = []
@@ -211,7 +226,10 @@ async def test_process_candle_dedupes_per_strategy(monkeypatch):
 
     async def fake_fetch_history(*_args, **_kwargs):
         return pd.DataFrame(
-            [{"timestamp": datetime.now(timezone.utc), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}]
+            [
+                {"timestamp": datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+                {"timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc), "open": 2, "high": 2, "low": 2, "close": 2, "volume": 2},
+            ]
         )
 
     persist_calls = 0
@@ -242,6 +260,46 @@ async def test_process_candle_dedupes_per_strategy(monkeypatch):
     assert len(first) == 2
     assert second == []
     assert persist_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_process_candle_signals_uses_previous_confirmed_candle(monkeypatch):
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    strategy = RecordingStrategy()
+    engine.strategies = {"s1": strategy}
+
+    async def fake_fetch_history(*_args, **_kwargs):
+        return pd.DataFrame(
+            [
+                {"timestamp": datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10},
+                {"timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc), "open": 101, "high": 102, "low": 100, "close": 101.5, "volume": 12},
+            ]
+        )
+
+    async def fake_persist_signal(_signal):
+        return "id-s1"
+
+    monkeypatch.setattr(engine, "_fetch_history", fake_fetch_history)
+    monkeypatch.setattr(engine, "_persist_signal", fake_persist_signal)
+
+    incoming = {
+        "symbol": "BTC",
+        "timeframe": "5m",
+        "timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc),
+        "open": 999,
+        "high": 999,
+        "low": 999,
+        "close": 999,
+        "volume": 999,
+    }
+
+    signals = await engine.process_candle_signals(incoming)
+
+    assert len(signals) == 1
+    assert strategy.last_ohlc is not None
+    assert strategy.last_ohlc["timestamp"] == datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc)
+    assert strategy.last_ohlc["close"] == 100.5
+    assert list(strategy.last_history["timestamp"]) == [datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc)]
 
 
 @pytest.mark.asyncio

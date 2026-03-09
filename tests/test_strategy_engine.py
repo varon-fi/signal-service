@@ -303,6 +303,84 @@ async def test_process_candle_signals_uses_previous_confirmed_candle(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_process_candle_signals_uses_last_bar_strictly_before_incoming(monkeypatch):
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    strategy = RecordingStrategy()
+    engine.strategies = {"s1": strategy}
+
+    async def fake_fetch_history(*_args, **_kwargs):
+        return pd.DataFrame(
+            [
+                {"timestamp": datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10},
+                {"timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc), "open": 101, "high": 102, "low": 100, "close": 101.5, "volume": 12},
+                {"timestamp": datetime(2026, 3, 9, 12, 10, tzinfo=timezone.utc), "open": 102, "high": 103, "low": 101, "close": 102.5, "volume": 14},
+            ]
+        )
+
+    async def fake_persist_signal(_signal):
+        return "id-s1"
+
+    monkeypatch.setattr(engine, "_fetch_history", fake_fetch_history)
+    monkeypatch.setattr(engine, "_persist_signal", fake_persist_signal)
+
+    incoming = {
+        "symbol": "BTC",
+        "timeframe": "5m",
+        "timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc),
+        "open": 999,
+        "high": 999,
+        "low": 999,
+        "close": 999,
+        "volume": 999,
+    }
+
+    signals = await engine.process_candle_signals(incoming)
+
+    assert len(signals) == 1
+    assert strategy.last_ohlc is not None
+    assert strategy.last_ohlc["timestamp"] == datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc)
+    assert list(strategy.last_history["timestamp"]) == [datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc)]
+
+
+@pytest.mark.asyncio
+async def test_process_candle_signals_startup_gate_uses_confirmed_candle(monkeypatch):
+    engine = StrategyEngine("postgresql://localhost/varon_fi")
+    strategy = RecordingStrategy()
+    engine.strategies = {"s1": strategy}
+    engine._startup_latest_ts["BTC:5m"] = datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc)
+
+    async def fake_fetch_history(*_args, **_kwargs):
+        return pd.DataFrame(
+            [
+                {"timestamp": datetime(2026, 3, 9, 12, 0, tzinfo=timezone.utc), "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10},
+                {"timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc), "open": 101, "high": 102, "low": 100, "close": 101.5, "volume": 12},
+            ]
+        )
+
+    async def fake_persist_signal(_signal):
+        return "id-s1"
+
+    monkeypatch.setattr(engine, "_fetch_history", fake_fetch_history)
+    monkeypatch.setattr(engine, "_persist_signal", fake_persist_signal)
+
+    incoming = {
+        "symbol": "BTC",
+        "timeframe": "5m",
+        "timestamp": datetime(2026, 3, 9, 12, 5, tzinfo=timezone.utc),
+        "open": 999,
+        "high": 999,
+        "low": 999,
+        "close": 999,
+        "volume": 999,
+    }
+
+    signals = await engine.process_candle_signals(incoming)
+
+    assert signals == []
+    assert strategy.last_ohlc is None
+
+
+@pytest.mark.asyncio
 async def test_process_candle_wrapper_keeps_backward_compat(monkeypatch):
     engine = StrategyEngine("postgresql://localhost/varon_fi")
 

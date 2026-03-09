@@ -497,24 +497,6 @@ class StrategyEngine:
             strategies_evaluated += 1
             strategy_id = str(getattr(strategy, "strategy_id", "") or strategy_key.split(":", 1)[0])
 
-            candle_ts = self._normalize_candle_ts(ohlc.get("timestamp") or ohlc.get("ts"))
-
-            if not self._in_strategy_session(strategy, candle_ts):
-                continue
-
-            if candle_ts is not None:
-                startup_key = f"{symbol}:{timeframe}"
-                startup_ts = self._startup_latest_ts.get(startup_key)
-                if startup_ts is not None and candle_ts <= startup_ts:
-                    continue
-
-            if candle_ts is not None:
-                dedupe_key = f"{strategy_key}:{symbol}:{timeframe}"
-                last_ts = self._last_candle_ts.get(dedupe_key)
-                if last_ts is not None and candle_ts <= last_ts:
-                    continue
-                self._last_candle_ts[dedupe_key] = candle_ts
-
             warmup_key = f"{strategy_key}:{symbol}:{timeframe}"
             required = self._warmup_required.get(warmup_key, 0)
             lookback_days = (strategy.params or {}).get("lookback_days")
@@ -535,6 +517,25 @@ class StrategyEngine:
                     timeframe=timeframe,
                 )
                 continue
+            confirmed_ts = self._normalize_candle_ts(
+                confirmed_ohlc.get("timestamp") or confirmed_ohlc.get("ts")
+            )
+
+            if not self._in_strategy_session(strategy, confirmed_ts):
+                continue
+
+            if confirmed_ts is not None:
+                startup_key = f"{symbol}:{timeframe}"
+                startup_ts = self._startup_latest_ts.get(startup_key)
+                if startup_ts is not None and confirmed_ts <= startup_ts:
+                    continue
+
+            if confirmed_ts is not None:
+                dedupe_key = f"{strategy_key}:{symbol}:{timeframe}"
+                last_ts = self._last_candle_ts.get(dedupe_key)
+                if last_ts is not None and confirmed_ts <= last_ts:
+                    continue
+                self._last_candle_ts[dedupe_key] = confirmed_ts
 
             if required > 0 and not self._warmup_complete.get(warmup_key, True):
                 if len(confirmed_history) < required:
@@ -625,12 +626,12 @@ class StrategyEngine:
 
         history_df = history_df.sort_values(ts_col).reset_index(drop=True)
         incoming_ts = self._normalize_candle_ts(incoming_ohlc.get("timestamp") or incoming_ohlc.get("ts"))
-        latest_ts = self._normalize_candle_ts(history_df.iloc[-1][ts_col])
 
         # When a new bar first appears in `ohlcs`, it is still forming and may be
         # reconciled later. Evaluate the previous completed candle instead.
-        if incoming_ts is not None and latest_ts is not None and latest_ts >= incoming_ts:
-            history_df = history_df.iloc[:-1].reset_index(drop=True)
+        if incoming_ts is not None:
+            ts_series = history_df[ts_col].apply(self._normalize_candle_ts)
+            history_df = history_df.loc[ts_series < incoming_ts].reset_index(drop=True)
 
         if history_df.empty:
             return None, history_df

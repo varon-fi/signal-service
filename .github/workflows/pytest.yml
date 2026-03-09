@@ -22,7 +22,7 @@ jobs:
       - name: Configure git auth for private deps
         if: ${{ secrets.ORG_READ_TOKEN != '' }}
         run: |
-          git config --global url."https://x-access-token:${{ secrets.ORG_READ_TOKEN }}@github.com/varon-fi/".insteadOf "https://github.com/varon-fi/"
+          git config --global url."https://${{ secrets.ORG_READ_TOKEN }}@github.com/varon-fi/".insteadOf "https://github.com/varon-fi/"
 
       - name: Install dependencies
         run: |
